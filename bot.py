@@ -20,7 +20,7 @@ DATA_URL = "https://journal.school28-kirov.ru/act/GET_STUDENT_DAIRY"
 USER_IDS = [134892480, 10083432]
 
 STUDENTS = {
-    "Кирилл": {
+    "Кирилла": {
         "student_id": "5201",
         "cls_id": "1073",
         "cookie": "ys-userId=n%3A6260; ys-user=s%3A%u041A%u043E%u0448%u0443%u0440%u043D%u0438%u043A%u043E%u0432; ys-password=s%3A253a2b69242b3f68978ba08ccce989b9575fc27e",
@@ -33,7 +33,7 @@ STUDENTS = {
             4: [2, 1, 11, 3, 400, 414, 411]
         }
     },
-    "Никита": {
+    "Никиты": {
         "student_id": "4722",
         "cls_id": "1088",
         "cookie": "ys-userId=n%3A4184; ys-user=s%3A%u041A%u043E%u0448%u0443%u0440%u043D%u0438%u043A%u043E%u0432; ys-password=s%3A0f4db6388746b33422d5ced1af1b979273a40257",
