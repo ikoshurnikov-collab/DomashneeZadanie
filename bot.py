@@ -10,6 +10,8 @@ import requests
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -72,15 +74,35 @@ SUBJECTS = {
     579: "Орлята России"
 }
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# --- Состояния и клавиатуры ---
+class GradesState(StatesGroup):
+    choosing_action = State()
+    waiting_for_start = State()
+    waiting_for_end = State()
 
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="ДЗ Кирилла"), KeyboardButton(text="ДЗ Никиты")]
+        [KeyboardButton(text="ДЗ Кирилла"), KeyboardButton(text="ДЗ Никиты")],
+        [KeyboardButton(text="Оценки Кирилла"), KeyboardButton(text="Оценки Никиты")]
     ],
     resize_keyboard=True
 )
+
+grades_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Отчет за неделю"), KeyboardButton(text="Выбранный период")],
+        [KeyboardButton(text="Назад")]
+    ],
+    resize_keyboard=True
+)
+
+back_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Назад")]],
+    resize_keyboard=True
+)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 def get_next_lesson_date(subject_id: int, current_date: datetime, schedule: dict) -> str:
     current_weekday = current_date.weekday()
@@ -91,24 +113,34 @@ def get_next_lesson_date(subject_id: int, current_date: datetime, schedule: dict
             return next_date.strftime("%d.%m.%Y")
     return "Дата неизвестна"
 
-def fetch_data(student_name: str):
+def validate_date(date_text: str):
+    try:
+        return datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
+    except ValueError:
+        return None
+
+def fetch_data(student_name: str, start_dt_str: str = None, end_dt_str: str = None):
     student_data = STUDENTS[student_name]
-    today = datetime.now()
-    start_of_week = today - timedelta(days=today.weekday())
-    end_of_week = start_of_week + timedelta(days=6)
+    
+    if not start_dt_str or not end_dt_str:
+        today = datetime.now()
+        start_of_week = today - timedelta(days=today.weekday())
+        end_of_week = start_of_week + timedelta(days=6)
+        start_dt_str = start_of_week.strftime("%d.%m.%Y")
+        end_dt_str = end_of_week.strftime("%d.%m.%Y")
 
     payload_data = {
         "pClassesIds": "",
         "student": student_data["student_id"],
         "cls": student_data["cls_id"],
-        "begin_dt": start_of_week.strftime("%d.%m.%Y"),
-        "end_dt": end_of_week.strftime("%d.%m.%Y")
+        "begin_dt": start_dt_str,
+        "end_dt": end_dt_str
     }
 
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Cookie": student_data["cookie"],
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "X-Requested-With": "XMLHttpRequest"
     }
 
@@ -186,8 +218,7 @@ def fetch_data(student_name: str):
 
 def get_new_updates(student_name: str):
     data = fetch_data(student_name)
-    if data is None:
-        return [], []
+    if data is None: return [], []
         
     current_hw, current_grades = data
     student_data = STUDENTS[student_name]
@@ -266,51 +297,132 @@ def format_grades_message(entries, title):
             msg += f"- {item['subject']}: {item['grade']}\n"
     return msg.strip()
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+# --- Хэндлеры навигации ---
+@dp.message(F.text == "Назад")
+async def btn_back(message: types.Message, state: FSMContext):
     if message.from_user.id not in USER_IDS: return
-    await message.answer("Бот запущен. Выберите действие на клавиатуре.", reply_markup=main_menu)
+    current_state = await state.get_state()
+    
+    if current_state in (GradesState.waiting_for_start, GradesState.waiting_for_end):
+        await state.set_state(GradesState.choosing_action)
+        await message.answer("Меню оценок. Выбери действие:", reply_markup=grades_menu)
+    else:
+        await state.clear()
+        await message.answer("Главное меню", reply_markup=main_menu)
 
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    if message.from_user.id not in USER_IDS: return
+    await state.clear()
+    await message.answer("Бот запущен. Выбери действие.", reply_markup=main_menu)
+
+# --- Хэндлеры домашнего задания ---
 @dp.message(F.text.in_({"ДЗ Кирилла", "ДЗ Никиты"}))
-async def force_check(message: types.Message):
+async def get_hw(message: types.Message):
     if message.from_user.id not in USER_IDS: return
     student_name = message.text.replace("ДЗ ", "")
-    await message.answer(f"Собираю данные для {student_name}...")
+    await message.answer(f"Собираю ДЗ для {student_name}...")
     
     data = fetch_data(student_name)
     if not data:
-        await message.answer(f"Не удалось получить данные для {student_name}.")
+        await message.answer("Не удалось получить данные.")
         return
         
-    current_hw, current_grades = data
-    
-    if not current_hw and not current_grades:
-        await message.answer(f"Заданий и оценок на эту неделю для {student_name} пока нет.")
+    current_hw, _ = data
+    if not current_hw:
+        await message.answer(f"Заданий на эту неделю для {student_name} пока нет.")
         return
         
-    if current_hw:
-        report_hw = format_hw_message(list(current_hw.values()), f"Текущие задания ({student_name}):")
-        await message.answer(report_hw, parse_mode="HTML")
-        
-    if current_grades:
-        report_gr = format_grades_message(list(current_grades.values()), f"Текущие оценки ({student_name}):")
-        await message.answer(report_gr, parse_mode="HTML")
+    report_hw = format_hw_message(list(current_hw.values()), f"Текущие задания ({student_name}):")
+    await message.answer(report_hw, parse_mode="HTML")
 
+# --- Хэндлеры оценок ---
+@dp.message(F.text.in_({"Оценки Кирилла", "Оценки Никиты"}))
+async def open_grades_menu(message: types.Message, state: FSMContext):
+    if message.from_user.id not in USER_IDS: return
+    student_name = message.text.replace("Оценки ", "")
+    await state.update_data(student_name=student_name)
+    await state.set_state(GradesState.choosing_action)
+    await message.answer(f"Меню оценок для {student_name}. Выбери действие:", reply_markup=grades_menu)
+
+@dp.message(GradesState.choosing_action, F.text == "Отчет за неделю")
+async def grades_week(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    student_name = data.get("student_name")
+    await message.answer(f"Собираю оценки за текущую неделю для {student_name}...")
+    
+    parsed_data = fetch_data(student_name)
+    if not parsed_data:
+        await message.answer("Не удалось получить данные.")
+        return
+        
+    _, current_grades = parsed_data
+    if not current_grades:
+        await message.answer("Оценок за эту неделю пока нет.")
+        return
+        
+    report = format_grades_message(list(current_grades.values()), f"Оценки за неделю ({student_name}):")
+    await message.answer(report, parse_mode="HTML")
+
+@dp.message(GradesState.choosing_action, F.text == "Выбранный период")
+async def grades_custom_period(message: types.Message, state: FSMContext):
+    await state.set_state(GradesState.waiting_for_start)
+    await message.answer("Введи начальную дату в формате ДД.ММ.ГГГГ (например, 01.09.2026):", reply_markup=back_menu)
+
+@dp.message(GradesState.waiting_for_start)
+async def process_start_date(message: types.Message, state: FSMContext):
+    date_str = validate_date(message.text.strip())
+    if not date_str:
+        await message.answer("Неверный формат. Введи дату как ДД.ММ.ГГГГ:")
+        return
+        
+    await state.update_data(start_date=date_str)
+    await state.set_state(GradesState.waiting_for_end)
+    await message.answer("Теперь введи конечную дату в формате ДД.ММ.ГГГГ:")
+
+@dp.message(GradesState.waiting_for_end)
+async def process_end_date(message: types.Message, state: FSMContext):
+    end_date = validate_date(message.text.strip())
+    if not end_date:
+        await message.answer("Неверный формат. Введи дату как ДД.ММ.ГГГГ:")
+        return
+        
+    user_data = await state.get_data()
+    start_date = user_data['start_date']
+    student_name = user_data['student_name']
+    
+    await message.answer(f"Собираю оценки с {start_date} по {end_date}...")
+    parsed_data = fetch_data(student_name, start_date, end_date)
+    
+    if not parsed_data:
+        await message.answer("Не удалось получить данные.")
+    else:
+        _, current_grades = parsed_data
+        if not current_grades:
+            await message.answer(f"За период с {start_date} по {end_date} оценок нет.")
+        else:
+            report = format_grades_message(list(current_grades.values()), f"Оценки с {start_date} по {end_date} ({student_name}):")
+            await message.answer(report, parse_mode="HTML")
+            
+    await state.set_state(GradesState.choosing_action)
+    await message.answer("Выбери действие:", reply_markup=grades_menu)
+
+# --- Фоновая рассылка ---
 async def check_and_send():
     for student_name in STUDENTS:
         new_hw, new_grades = get_new_updates(student_name)
         
         if new_hw:
-            report_hw = format_hw_message(new_hw, f"Внимание, появились новые задания ({student_name}).")
+            report_hw = format_hw_message(new_hw, f"Внимание, новые задания ({student_name}).")
             for user_id in USER_IDS:
                 try: await bot.send_message(chat_id=user_id, text=report_hw, parse_mode="HTML")
-                except Exception as e: logging.error(f"Ошибка отправки ДЗ {user_id}: {e}")
+                except Exception as e: logging.error(f"Ошибка ДЗ {user_id}: {e}")
                 
         if new_grades:
-            report_gr = format_grades_message(new_grades, f"Внимание, появились новые оценки ({student_name}).")
+            report_gr = format_grades_message(new_grades, f"Внимание, новые оценки ({student_name}).")
             for user_id in USER_IDS:
                 try: await bot.send_message(chat_id=user_id, text=report_gr, parse_mode="HTML")
-                except Exception as e: logging.error(f"Ошибка отправки оценок {user_id}: {e}")
+                except Exception as e: logging.error(f"Ошибка оценок {user_id}: {e}")
                 
         await asyncio.sleep(5)
 
