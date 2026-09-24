@@ -31,6 +31,9 @@ STUDENTS = {
             2: [1, 5, 8, 10, 3],
             3: [81, 5, 1, 2, 12],
             4: [2, 1, 11, 3, 400, 414, 411]
+        },
+        "allowed_teachers": {
+            # 3: 4233 
         }
     },
     "Никиты": {
@@ -44,7 +47,8 @@ STUDENTS = {
             2: [12, 2, 5, 1, 8, 579],
             3: [3, 5, 1, 81, 411],
             4: [1, 12, 8, 2, 11]
-        }
+        },
+        "allowed_teachers": {}
     }
 }
 
@@ -143,8 +147,19 @@ def fetch_current_homework(student_name: str):
 
         subject_id = lesson[2]
         homework = lesson[4]
+        teacher_id = lesson[9] if len(lesson) > 9 else None
         
         if homework and homework.strip():
+            # Шпионский лог для поиска ID учителя
+            if subject_id == 3:
+                logging.info(f"[{student_name}] Английский! Учитель ID: {teacher_id} | ДЗ: {homework.strip()[:50]}...")
+            
+            # Жесткий фильтр по учителям
+            allowed_teachers = student_data.get("allowed_teachers", {})
+            if subject_id in allowed_teachers:
+                if teacher_id != allowed_teachers[subject_id]:
+                    continue 
+                    
             next_date = get_next_lesson_date(subject_id, lesson_date, student_data["schedule"])
             subj_name = SUBJECTS.get(subject_id, f"Предмет {subject_id}")
             hw_key = f"{lesson_date.strftime('%Y-%m-%d')}_{subject_id}"
@@ -248,7 +263,7 @@ async def check_and_send():
         await asyncio.sleep(5)
 
 async def main():
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(check_and_send, "cron", hour="13-20", minute=0)
     scheduler.start()
     
