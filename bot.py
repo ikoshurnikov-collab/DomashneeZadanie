@@ -33,7 +33,7 @@ STUDENTS = {
             4: [2, 1, 11, 3, 400, 414, 411]
         },
         "allowed_teachers": {
-            # 3: 4233 
+            3: 4233
         }
     },
     "Никиты": {
@@ -150,15 +150,13 @@ def fetch_current_homework(student_name: str):
         teacher_id = lesson[9] if len(lesson) > 9 else None
         
         if homework and homework.strip():
-            # Шпионский лог для поиска ID учителя
-            if subject_id == 3:
-                logging.info(f"[{student_name}] Английский! Учитель ID: {teacher_id} | ДЗ: {homework.strip()[:50]}...")
-            
-            # Жесткий фильтр по учителям
             allowed_teachers = student_data.get("allowed_teachers", {})
-            if subject_id in allowed_teachers:
-                if teacher_id != allowed_teachers[subject_id]:
-                    continue 
+            safe_allowed = {str(k): str(v) for k, v in allowed_teachers.items()}
+            
+            str_subj = str(subject_id)
+            if str_subj in safe_allowed:
+                if str(teacher_id) != safe_allowed[str_subj]:
+                    continue
                     
             next_date = get_next_lesson_date(subject_id, lesson_date, student_data["schedule"])
             subj_name = SUBJECTS.get(subject_id, f"Предмет {subject_id}")
