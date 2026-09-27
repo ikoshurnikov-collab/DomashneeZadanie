@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 BOT_TOKEN = "8856676116:AAFaydzhS9EGQ2WS-vPnzpuwKLeq8XDgq0o"
 DATA_URL = "https://journal.school28-kirov.ru/act/GET_STUDENT_DAIRY"
 
-USER_IDS = [134892480, 10083432]
+ADMIN_IDS = [134892480, 10083432]
 
 STUDENTS = {
     "Кирилла": {
@@ -28,6 +28,7 @@ STUDENTS = {
         "cookie": "ys-userId=n%3A6260; ys-user=s%3A%u041A%u043E%u0448%u0443%u0440%u043D%u0438%u043A%u043E%u0432; ys-password=s%3A253a2b69242b3f68978ba08ccce989b9575fc27e",
         "cache_file": "hw_cache_kirill.json",
         "grades_cache_file": "grades_cache_kirill.json",
+        "notify_chats": [134892480, 10083432],
         "schedule": {
             0: [406, 2, 5, 1, 13, 579],
             1: [2, 5, 1, 8, 12],
@@ -35,9 +36,7 @@ STUDENTS = {
             3: [81, 5, 1, 2, 12],
             4: [2, 1, 11, 3, 400, 414, 411]
         },
-        "allowed_teachers": {
-            3: 4233
-        }
+        "allowed_teachers": {3: 4233}
     },
     "Никиты": {
         "student_id": "4722",
@@ -45,6 +44,7 @@ STUDENTS = {
         "cookie": "ys-userId=n%3A4184; ys-user=s%3A%u041A%u043E%u0448%u0443%u0440%u043D%u0438%u043A%u043E%u0432; ys-password=s%3A0f4db6388746b33422d5ced1af1b979273a40257",
         "cache_file": "hw_cache_nikita.json",
         "grades_cache_file": "grades_cache_nikita.json",
+        "notify_chats": [134892480, 10083432],
         "schedule": {
             0: [406, 5, 1, 414, 2, 13],
             1: [5, 1, 2, 10, 3],
@@ -53,6 +53,38 @@ STUDENTS = {
             4: [1, 12, 8, 2, 11]
         },
         "allowed_teachers": {}
+    },
+    "Ани": {
+        "student_id": "4353",
+        "cls_id": "1052",
+        "cookie": "ys-userId=n%3A3525; ys-user=s%3A%u0422%u044B%u0440%u044B%u043A%u0438%u043D%u0430; ys-password=s%3A92f53cad2d335c9c9129798a493a6b2622a98e0f",
+        "cache_file": "hw_cache_anya.json",
+        "grades_cache_file": "grades_cache_anya.json",
+        "notify_chats": [486743691],
+        "schedule": {
+            0: [406, 414, 411, 3, 1, 5, 2],
+            1: [2, 8, 1, 81, 10],
+            2: [12, 5, 1, 2, 11],
+            3: [8, 5, 1, 2, 13],
+            4: [5, 12, 3, 1, 579, 413]
+        },
+        "allowed_teachers": {3: 4233}
+    },
+    "Насти": {
+        "student_id": "4039",
+        "cls_id": "1064",
+        "cookie": "ys-userId=n%3A4434; ys-user=s%3A%u0422%u044B%u0440%u044B%u043A%u0438%u043D%u0430; ys-password=s%3A5ae54bef1ea265fe7900f82b07e30c93307ea199",
+        "cache_file": "hw_cache_nastya.json",
+        "grades_cache_file": "grades_cache_nastya.json",
+        "notify_chats": [486743691],
+        "schedule": {
+            0: [406, 16, 5, 1, 10],
+            1: [5, 12, 6, 1, 13],
+            2: [7, 20, 5, 1, 16, 3],
+            3: [82, 7, 5, 1, 19, 11],
+            4: [1, 12, 5, 16, 7, 3]
+        },
+        "allowed_teachers": {3: 4163}
     }
 }
 
@@ -61,29 +93,39 @@ SUBJECTS = {
     2: "Литературное чтение",
     3: "Иностранный язык",
     5: "Математика",
+    6: "Информатика и ИКТ",
+    7: "История",
     8: "Окружающий мир",
     10: "Музыка",
     11: "Изобразительное искусство",
     12: "Физическая культура",
     13: "Труд (технология)",
+    16: "Литература",
+    19: "География",
+    20: "Биология",
     81: "Информатика и ИКТ",
+    82: "Духовно-нравственная культура России",
     400: "Основы религиозных культур и светской этики",
     406: "Разговоры о важном",
     411: "Функциональная грамотность",
+    413: "Мир профессий",
     414: "Робототехника",
-    579: "Орлята России"
+    570: "Мир вокруг нас",
+    579: "Орлята России",
+    601: "Плавание"
 }
 
-# --- Состояния и клавиатуры ---
 class GradesState(StatesGroup):
     choosing_action = State()
     waiting_for_start = State()
     waiting_for_end = State()
 
-main_menu = ReplyKeyboardMarkup(
+main_admin_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="ДЗ Кирилла"), KeyboardButton(text="ДЗ Никиты")],
-        [KeyboardButton(text="Оценки Кирилла"), KeyboardButton(text="Оценки Никиты")]
+        [KeyboardButton(text="ДЗ Ани"), KeyboardButton(text="ДЗ Насти")],
+        [KeyboardButton(text="Оценки Кирилла"), KeyboardButton(text="Оценки Никиты")],
+        [KeyboardButton(text="Оценки Ани"), KeyboardButton(text="Оценки Насти")]
     ],
     resize_keyboard=True
 )
@@ -195,14 +237,22 @@ def fetch_data(student_name: str, start_dt_str: str = None, end_dt_str: str = No
         subj_name = SUBJECTS.get(subject_id, f"Предмет {subject_id}")
         hw_key = f"{lesson_date.strftime('%Y-%m-%d')}_{subject_id}"
         
-        if homework and str(homework).strip():
-            next_date = get_next_lesson_date(subject_id, lesson_date, student_data["schedule"])
-            current_hw[hw_key] = {
-                "given_date": lesson_date.strftime("%d.%m.%Y"),
-                "due_date": next_date,
-                "subject": subj_name,
-                "text": str(homework).strip()
-            }
+        if homework:
+            hw_str = str(homework).strip()
+            if hw_str and hw_str.lower() not in ["не задано", "нет"]:
+                topic = lesson[3] if len(lesson) > 3 else ""
+                full_text = ""
+                if topic and str(topic).strip():
+                    full_text += f"Тема: {str(topic).strip()}\n"
+                full_text += f"ДЗ: {hw_str}"
+
+                next_date = get_next_lesson_date(subject_id, lesson_date, student_data["schedule"])
+                current_hw[hw_key] = {
+                    "given_date": lesson_date.strftime("%d.%m.%Y"),
+                    "due_date": next_date,
+                    "subject": subj_name,
+                    "text": full_text
+                }
             
         if grade and str(grade).strip():
             if hw_key in current_grades:
@@ -297,10 +347,9 @@ def format_grades_message(entries, title):
             msg += f"- {item['subject']}: {item['grade']}\n"
     return msg.strip()
 
-# --- Хэндлеры навигации ---
 @dp.message(F.text == "Назад")
 async def btn_back(message: types.Message, state: FSMContext):
-    if message.from_user.id not in USER_IDS: return
+    if message.from_user.id not in ADMIN_IDS: return
     current_state = await state.get_state()
     
     if current_state in (GradesState.waiting_for_start, GradesState.waiting_for_end):
@@ -308,18 +357,19 @@ async def btn_back(message: types.Message, state: FSMContext):
         await message.answer("Меню оценок. Выбери действие:", reply_markup=grades_menu)
     else:
         await state.clear()
-        await message.answer("Главное меню", reply_markup=main_menu)
+        await message.answer("Главное меню", reply_markup=main_admin_menu)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    if message.from_user.id not in USER_IDS: return
     await state.clear()
-    await message.answer("Бот запущен. Выбери действие.", reply_markup=main_menu)
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("Бот запущен. Выбери действие.", reply_markup=main_admin_menu)
+    elif message.from_user.id == 486743691:
+        await message.answer("Вы успешно подписаны на уведомления об оценках и домашних заданиях Ани и Насти.")
 
-# --- Хэндлеры домашнего задания ---
-@dp.message(F.text.in_({"ДЗ Кирилла", "ДЗ Никиты"}))
+@dp.message(F.text.in_({"ДЗ Кирилла", "ДЗ Никиты", "ДЗ Ани", "ДЗ Насти"}))
 async def get_hw(message: types.Message):
-    if message.from_user.id not in USER_IDS: return
+    if message.from_user.id not in ADMIN_IDS: return
     student_name = message.text.replace("ДЗ ", "")
     await message.answer(f"Собираю ДЗ для {student_name}...")
     
@@ -336,10 +386,9 @@ async def get_hw(message: types.Message):
     report_hw = format_hw_message(list(current_hw.values()), f"Текущие задания ({student_name}):")
     await message.answer(report_hw, parse_mode="HTML")
 
-# --- Хэндлеры оценок ---
-@dp.message(F.text.in_({"Оценки Кирилла", "Оценки Никиты"}))
+@dp.message(F.text.in_({"Оценки Кирилла", "Оценки Никиты", "Оценки Ани", "Оценки Насти"}))
 async def open_grades_menu(message: types.Message, state: FSMContext):
-    if message.from_user.id not in USER_IDS: return
+    if message.from_user.id not in ADMIN_IDS: return
     student_name = message.text.replace("Оценки ", "")
     await state.update_data(student_name=student_name)
     await state.set_state(GradesState.choosing_action)
@@ -407,22 +456,22 @@ async def process_end_date(message: types.Message, state: FSMContext):
     await state.set_state(GradesState.choosing_action)
     await message.answer("Выбери действие:", reply_markup=grades_menu)
 
-# --- Фоновая рассылка ---
 async def check_and_send():
-    for student_name in STUDENTS:
+    for student_name, student_data in STUDENTS.items():
         new_hw, new_grades = get_new_updates(student_name)
+        notify_chats = student_data.get("notify_chats", [])
         
         if new_hw:
             report_hw = format_hw_message(new_hw, f"Внимание, новые задания ({student_name}).")
-            for user_id in USER_IDS:
-                try: await bot.send_message(chat_id=user_id, text=report_hw, parse_mode="HTML")
-                except Exception as e: logging.error(f"Ошибка ДЗ {user_id}: {e}")
+            for chat_id in notify_chats:
+                try: await bot.send_message(chat_id=chat_id, text=report_hw, parse_mode="HTML")
+                except Exception as e: logging.error(f"Ошибка ДЗ {chat_id}: {e}")
                 
         if new_grades:
             report_gr = format_grades_message(new_grades, f"Внимание, новые оценки ({student_name}).")
-            for user_id in USER_IDS:
-                try: await bot.send_message(chat_id=user_id, text=report_gr, parse_mode="HTML")
-                except Exception as e: logging.error(f"Ошибка оценок {user_id}: {e}")
+            for chat_id in notify_chats:
+                try: await bot.send_message(chat_id=chat_id, text=report_gr, parse_mode="HTML")
+                except Exception as e: logging.error(f"Ошибка оценок {chat_id}: {e}")
                 
         await asyncio.sleep(5)
 
