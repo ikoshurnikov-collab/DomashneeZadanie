@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -23,9 +24,12 @@ GAS_SECRET = os.getenv("GAS_SECRET", "")
 DATA_URL = "https://journal.school28-kirov.ru/act/GET_STUDENT_DAIRY"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
-# Две сессии для повторного использования TCP-соединений без конфликта потоков
-API_SESSION = requests.Session()
+DATA_DIR = os.getenv("DATA_DIR", ".")
+CACHE_FILE = os.path.join(DATA_DIR, "hw_cache.json")
+STATES_FILE = os.path.join(DATA_DIR, "user_states.json")
+
 POLL_SESSION = requests.Session()
+GAS_LOCK = asyncio.Lock()
 
 # ID пользователей в MAX
 ID_IGOR = 11423510
@@ -36,9 +40,8 @@ ID_OLYA = 62297217
 ID_KIRILL = 207924440
 ID_NIKITA = 200548363
 ID_ANYA = int(os.getenv("ID_ANYA", "0"))
-ID_NASTYA = 66786192
+ID_NASTYA = int(os.getenv("ID_NASTYA", "0"))
 
-# Права доступа взрослых к ручному просмотру ДЗ и оценок
 ADULT_ACCESS = {
     ID_IGOR: ["Кирилла", "Никиты", "Ани", "Насти"],
     ID_KATYA: ["Кирилла", "Никиты"],
@@ -46,12 +49,11 @@ ADULT_ACCESS = {
     ID_OLYA: ["Ани", "Насти"]
 }
 
-# Персональные приветствия для взрослых
 ADULT_GREETINGS = {
     ID_IGOR: "Привет, Игорь! 🫡 Главный пульт управления школой на связи. Кого проверяем?",
-    ID_KATYA: "Намасте, Катюша! 🌸 Заглянем в дневники наших парней? Выбирай нужный раздел:",
-    ID_GRANDMA: "Здравствуйте, бабуля Наташа! 🌺 Спасибо за вашу заботу и помощь с уроками! Выберите, что хотите посмотреть:",
-    ID_OLYA: "Привет, Оля! ☀️ Дневники девчонок под строгим депутатским контролем. Выбирай раздел:"
+    ID_KATYA: "Привет, Катюша! 🌸 Заглянем в дневники наших парней? Выбирай нужный раздел:",
+    ID_GRANDMA: "Здравствуйте, бабушка Наташа! 🌺 Спасибо за вашу заботу и помощь с уроками! Выберите, что хотите посмотреть:",
+    ID_OLYA: "Привет, Оля! ☀️ Дневники девчонок под контролем. Выбирай раздел:"
 }
 
 STUDENTS = {
@@ -83,7 +85,7 @@ STUDENTS = {
         "key": "nikita",
         "nominative": "Никита",
         "gender": "m",
-        "child_greeting": "Привет, Никита! ⚡️ Время включить суперсилу и разделаться с домашкой, чтобы побыстрее потанцевать и порисовать! Выбирай день:",
+        "child_greeting": "Привет, Никита! ⚡️ Время включить суперсилу и разделаться с домашкой! Выбирай день:",
         "student_id": os.getenv("STUDENT_ID_NIKITA", "4722"),
         "cls_id": os.getenv("CLS_ID_NIKITA", "1088"),
         "cookie": os.getenv(
@@ -200,7 +202,100 @@ WEEKDAYS_SHORT = {
     6: "вс"
 }
 
+HW_CACHE = {}
 USER_STATES = {}
+
+
+# --- ЛОКАЛЬНЫЙ КЭШ НА ДИСКЕ ---
+
+def load_local_data():
+    global HW_CACHE, USER_STATES
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                HW_CACHE = json.load(f)
+            logging.info(f"Загружен локальный кэш ДЗ: {len(HW_CACHE)} записей")
+        if os.path.exists(STATES_FILE):
+            with open(STATES_FILE, "r", encoding="utf-8") as f:
+                raw_states = json.load(f)
+                USER_STATES = {int(k): v for k, v in raw_states.items()}
+    except Exception as e:
+        logging.error(f"Ошибка чтения локального кэша: {e}")
+
+
+def save_hw_cache():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(HW_CACHE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, CACHE_FILE)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения кэша ДЗ: {e}")
+
+
+def save_user_states():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = STATES_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in USER_STATES.items()}, f, ensure_ascii=False)
+        os.replace(tmp_path, STATES_FILE)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения состояний: {e}")
+
+
+def set_user_state(user_id: int, state_dict: dict):
+    USER_STATES[user_id] = state_dict
+    save_user_states()
+
+
+def pop_user_state(user_id: int):
+    val = USER_STATES.pop(user_id, None)
+    if val is not None:
+        save_user_states()
+    return val
+
+
+def merge_avers_into_cache(student_name: str, hw_list: list):
+    changed = False
+    for h in hw_list:
+        hid = h["id"]
+        if hid not in HW_CACHE:
+            HW_CACHE[hid] = {
+                "id": hid,
+                "student": student_name,
+                "given_date": h["given_date"],
+                "due_date": h["due_date"],
+                "subject": h["subject"],
+                "text": h["text"],
+                "status": "new",
+                "notified_child": "no",
+                "photos": "",
+                "comment": ""
+            }
+            changed = True
+        else:
+            existing = HW_CACHE[hid]
+            if existing.get("text") != h["text"] or existing.get("due_date") != h["due_date"]:
+                if existing.get("text") != h["text"]:
+                    existing["notified_child"] = "no"
+                existing["text"] = h["text"]
+                existing["due_date"] = h["due_date"]
+                changed = True
+    if changed:
+        save_hw_cache()
+
+
+def merge_gas_items_into_cache(items: list):
+    if not items:
+        return
+    for item in items:
+        hid = item.get("id")
+        if hid:
+            HW_CACHE[hid] = item
+    save_hw_cache()
 
 
 def get_child_student_name(user_id: int):
@@ -245,99 +340,283 @@ def cb_btn(text: str, payload: str):
     }
 
 
-def _sync_send_message(user_id: int, text: str, buttons=None, extra_attachments=None):
-    attachments = []
-    if extra_attachments:
-        attachments.extend(extra_attachments)
-    if buttons:
-        attachments.append(make_keyboard(buttons))
+def split_html_text(text: str, max_len: int = 3800) -> list:
+    if not text:
+        return [""]
+    if len(text) <= max_len:
+        return [text]
 
-    body = {
-        "text": text,
-        "format": "html"
-    }
-    if attachments:
-        body["attachments"] = attachments
+    chunks = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(block) <= max_len:
+                current = block
+            else:
+                for line in block.split("\n"):
+                    line_cand = f"{current}\n{line}" if current else line
+                    if len(line_cand) <= max_len:
+                        current = line_cand
+                    else:
+                        if current:
+                            chunks.append(current)
+                        while len(line) > max_len:
+                            chunks.append(line[:max_len])
+                            line = line[max_len:]
+                        current = line
+    if current:
+        chunks.append(current)
+    return chunks
 
+
+def _post_max_raw(user_id: int, body: dict):
+    return requests.post(
+        f"{MAX_API_URL}/messages",
+        params={"user_id": user_id},
+        headers=max_headers(),
+        json=body,
+        timeout=20
+    )
+
+
+def _reupload_media_from_url(media_url: str, media_type: str):
+    if not media_url:
+        return None
     try:
-        resp = API_SESSION.post(
-            f"{MAX_API_URL}/messages",
-            params={"user_id": user_id},
-            headers=max_headers(),
-            json=body,
+        file_resp = requests.get(media_url, timeout=20)
+        if file_resp.status_code != 200:
+            logging.error(f"Не удалось скачать файл для перезагрузки ({file_resp.status_code})")
+            return None
+
+        up_type = "image" if media_type == "image" else ("audio" if media_type == "audio" else "file")
+        init_resp = requests.post(
+            f"{MAX_API_URL}/uploads",
+            params={"type": up_type},
+            headers={"Authorization": BOT_TOKEN},
             timeout=15
         )
-        if resp.status_code != 200 and extra_attachments and buttons:
-            body_media = {"text": text, "format": "html", "attachments": extra_attachments}
-            API_SESSION.post(
-                f"{MAX_API_URL}/messages",
-                params={"user_id": user_id},
-                headers=max_headers(),
-                json=body_media,
-                timeout=15
-            )
-            body_kb = {"text": "Выбери действие 👇", "format": "html", "attachments": [make_keyboard(buttons)]}
-            API_SESSION.post(
-                f"{MAX_API_URL}/messages",
-                params={"user_id": user_id},
-                headers=max_headers(),
-                json=body_kb,
-                timeout=15
-            )
+        if init_resp.status_code != 200:
+            logging.error(f"Ошибка POST /uploads ({init_resp.status_code}): {init_resp.text}")
+            return None
+
+        init_data = init_resp.json()
+        upload_url = init_data.get("url")
+        pre_token = init_data.get("token")
+        if not upload_url:
+            return None
+
+        ext = "jpg" if up_type == "image" else ("mp3" if up_type == "audio" else "bin")
+        mime = file_resp.headers.get("Content-Type", "application/octet-stream")
+        up_resp = requests.post(
+            upload_url,
+            files={"data": (f"upload.{ext}", file_resp.content, mime)},
+            timeout=30
+        )
+        if up_resp.status_code != 200:
+            logging.error(f"Ошибка загрузки файла на CDN MAX ({up_resp.status_code}): {up_resp.text}")
+            return None
+
+        if up_type == "audio" and pre_token:
+            return {"type": "audio", "payload": {"token": pre_token}}
+
+        up_json = up_resp.json()
+        return {"type": up_type, "payload": up_json}
     except Exception as e:
-        logging.error(f"Ошибка отправки сообщения в MAX пользователю {user_id}: {e}")
+        logging.error(f"Ошибка перезагрузки вложения в MAX: {e}")
+        return None
 
 
-async def send_max_message(user_id: int, text: str, buttons=None, extra_attachments=None):
-    await asyncio.to_thread(_sync_send_message, user_id, text, buttons, extra_attachments)
+def _send_with_attachment_retry(user_id: int, body: dict) -> bool:
+    for attempt in range(3):
+        resp = _post_max_raw(user_id, body)
+        if resp.status_code == 200:
+            return True
+        if "attachment.not.ready" in resp.text and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        logging.warning(f"MAX отклонил отправку ({resp.status_code}) для {user_id}: {resp.text}")
+        return False
+    return False
 
 
-def _sync_answer_callback(callback_id: str, text: str = None, buttons=None, notification: str = None):
+def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) -> bool:
+    chunks = split_html_text(text, max_len=3800)
+
+    try:
+        # Отправляем все промежуточные части длинного текста без кнопок
+        for part in chunks[:-1]:
+            resp = _post_max_raw(user_id, {"text": part, "format": "html"})
+            if resp.status_code != 200:
+                logging.error(f"Ошибка отправки части сообщения пользователю {user_id} ({resp.status_code}): {resp.text}")
+
+        last_text = chunks[-1]
+
+        # Обычное сообщение без медиафайлов
+        if not media_items:
+            body = {"text": last_text, "format": "html"}
+            if buttons:
+                body["attachments"] = [make_keyboard(buttons)]
+            resp = _post_max_raw(user_id, body)
+            if resp.status_code != 200:
+                logging.error(f"Ошибка отправки сообщения пользователю {user_id} ({resp.status_code}): {resp.text}")
+                return False
+            return True
+
+        # Нормализация списка медиавложений
+        normalized = []
+        for m in media_items[:11]:
+            if isinstance(m, str):
+                normalized.append({"type": "image", "token": m, "url": ""})
+            elif isinstance(m, dict):
+                normalized.append({
+                    "type": m.get("type", "image"),
+                    "token": m.get("token", ""),
+                    "url": m.get("url", "")
+                })
+
+        # Попытка 1: отправка по токену вложения
+        token_atts = [{"type": m["type"], "payload": {"token": m["token"]}} for m in normalized if m.get("token")]
+        if token_atts:
+            atts = list(token_atts) + ([make_keyboard(buttons)] if buttons else [])
+            if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": atts}):
+                return True
+            if buttons:
+                if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": token_atts}):
+                    _post_max_raw(user_id, {"text": "Выберите действие 👇", "format": "html", "attachments": [make_keyboard(buttons)]})
+                    return True
+
+        # Попытка 2: отправка изображений напрямую по URL
+        url_atts = [{"type": "image", "payload": {"url": m["url"]}} for m in normalized if m["type"] == "image" and m.get("url")]
+        if url_atts and len(url_atts) == len(normalized):
+            atts = list(url_atts) + ([make_keyboard(buttons)] if buttons else [])
+            if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": atts}):
+                return True
+
+        # Попытка 3: перезагрузка медиафайлов от имени самого бота через POST /uploads
+        reuploaded_atts = []
+        for m in normalized:
+            re_att = _reupload_media_from_url(m.get("url", ""), m["type"])
+            if re_att:
+                reuploaded_atts.append(re_att)
+
+        if reuploaded_atts:
+            time.sleep(1.0)
+            atts = list(reuploaded_atts) + ([make_keyboard(buttons)] if buttons else [])
+            if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": atts}):
+                return True
+            if buttons:
+                if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": reuploaded_atts}):
+                    _post_max_raw(user_id, {"text": "Выберите действие 👇", "format": "html", "attachments": [make_keyboard(buttons)]})
+                    return True
+
+        logging.error(f"Не удалось доставить медиавложения пользователю {user_id} ни одним из способов")
+        return False
+
+    except Exception as e:
+        logging.error(f"Исключение при отправке в MAX пользователю {user_id}: {e}")
+        return False
+
+
+async def send_max_message(user_id: int, text: str, buttons=None, extra_attachments=None) -> bool:
+    return await asyncio.to_thread(_sync_send_message, user_id, text, buttons, extra_attachments)
+
+
+def _sync_answer_callback(callback_id: str, user_id: int = None, text: str = None, buttons=None, notification: str = None):
     body = {}
     if notification:
         body["notification"] = notification
     if text is not None:
-        msg_obj = {
-            "text": text,
+        safe_text = text if len(text) <= 3900 else (text[:3890] + "...")
+        body["message"] = {
+            "text": safe_text,
             "format": "html",
             "attachments": [make_keyboard(buttons)] if buttons else []
         }
-        body["message"] = msg_obj
 
     try:
-        API_SESSION.post(
+        resp = requests.post(
             f"{MAX_API_URL}/answers",
             params={"callback_id": callback_id},
             headers=max_headers(),
             json=body,
             timeout=15
         )
+        if resp.status_code != 200:
+            logging.warning(f"MAX /answers вернул {resp.status_code}: {resp.text}")
+            if text is not None and user_id:
+                _sync_send_message(user_id, text, buttons=buttons)
     except Exception as e:
         logging.error(f"Ошибка ответа на callback в MAX: {e}")
+        if text is not None and user_id:
+            _sync_send_message(user_id, text, buttons=buttons)
 
 
-async def answer_max_callback(callback_id: str, text: str = None, buttons=None, notification: str = None):
-    await asyncio.to_thread(_sync_answer_callback, callback_id, text, buttons, notification)
+async def answer_max_callback(callback_id: str, user_id: int = None, text: str = None, buttons=None, notification: str = None):
+    await asyncio.to_thread(_sync_answer_callback, callback_id, user_id, text, buttons, notification)
 
 
 # --- РАБОТА С GOOGLE ТАБЛИЦЕЙ (APPS SCRIPT) ---
 
-def _sync_gas_request(payload: dict):
+def _sync_gas_request(payload: dict, retries: int = 2):
+    req_data = dict(payload)
     if GAS_SECRET:
-        payload["secret"] = GAS_SECRET
-    try:
-        resp = API_SESSION.post(GAS_URL, json=payload, timeout=20)
-        if resp.status_code != 200:
-            logging.error(f"Ошибка HTTP от Google Таблицы: {resp.status_code}")
-            return None
-        return resp.json()
-    except Exception as e:
-        logging.error(f"Ошибка обращения к Google Таблице: {e}")
-        return None
+        req_data["secret"] = GAS_SECRET
+
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(
+                GAS_URL,
+                json=req_data,
+                headers={"Connection": "close"},
+                timeout=(8, 15)
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logging.error(f"Ошибка HTTP от Google Таблицы: {resp.status_code} (попытка {attempt + 1})")
+        except Exception as e:
+            logging.warning(f"Сбой связи с Google Таблицей (попытка {attempt + 1}/{retries + 1}): {e}")
+        if attempt < retries:
+            time.sleep(2 * (attempt + 1))
+    return None
 
 
-async def gas_request(payload: dict):
-    return await asyncio.to_thread(_sync_gas_request, payload)
+async def gas_request(payload: dict, retries: int = 2):
+    async with GAS_LOCK:
+        return await asyncio.to_thread(_sync_gas_request, payload, retries)
+
+
+async def refresh_hw_cache_from_gas():
+    res = await gas_request({"action": "get_hw"}, retries=2)
+    if res and res.get("status") == "ok":
+        merge_gas_items_into_cache(res.get("items", []))
+        return True
+    return False
+
+
+async def bg_update_gas_status(hw_id: str, status: str = None, photos: str = None, comment: str = None):
+    payload = {"action": "update_status", "id": hw_id}
+    if status is not None:
+        payload["status"] = status
+    if photos is not None:
+        payload["photos"] = photos
+    if comment is not None:
+        payload["comment"] = comment
+    await gas_request(payload, retries=3)
+
+
+async def bg_sync_student_to_gas(student_name: str, hw_list: list, grades_list: list):
+    await gas_request({
+        "action": "sync",
+        "student": student_name,
+        "hw_list": hw_list,
+        "grades_list": grades_list
+    }, retries=2)
 
 
 # --- ПАРСИНГ ДНЕВНИКА АВЕРС ---
@@ -364,7 +643,6 @@ def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: s
     if not start_dt_str or not end_dt_str:
         today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
         start_of_week = today - timedelta(days=today.weekday())
-        # Захватываем полные 7 дней прошлой недели для предметов, идущих 1 раз в неделю
         begin_dt = start_of_week - timedelta(days=7)
         end_dt = start_of_week + timedelta(days=6)
         start_dt_str = begin_dt.strftime("%d.%m.%Y")
@@ -382,17 +660,30 @@ def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: s
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Cookie": student_data["cookie"],
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest"
+        "X-Requested-With": "XMLHttpRequest",
+        "Connection": "close"
     }
 
-    try:
-        response = API_SESSION.post(DATA_URL, data=payload_data, headers=headers, timeout=15)
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Сетевая ошибка Аверс ({student_name}): {e}")
-        return None
+    response = None
+    for attempt in range(2):
+        try:
+            response = requests.post(DATA_URL, data=payload_data, headers=headers, timeout=15)
+            if response.status_code == 200:
+                break
+            if attempt == 0 and response.status_code >= 500:
+                time.sleep(2)
+                continue
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Сетевая ошибка Аверс ({student_name}): {e}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return None
 
-    if response.status_code != 200 or "login" in response.url.lower():
-        logging.error(f"Ошибка доступа к Аверс ({student_name}): статус {response.status_code}, URL {response.url}")
+    if not response or response.status_code != 200 or "login" in response.url.lower():
+        code = response.status_code if response else "no_response"
+        url_info = response.url if response else DATA_URL
+        logging.error(f"Ошибка доступа к Аверс ({student_name}): статус {code}, URL {url_info}")
         return None
 
     clean_text = re.sub(r'new Date\((.*?)\)', r'"\1"', response.text)
@@ -460,7 +751,6 @@ def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: s
 
                 next_date = get_next_lesson_date(subject_id, lesson_date, student_data["schedule"])
                 if item_id in current_hw:
-                    # Склейка разных заданий для сдвоенных уроков без дублирования одинакового текста
                     if full_text not in current_hw[item_id]["text"]:
                         current_hw[item_id]["text"] += f"\n\n{full_text}"
                 else:
@@ -589,16 +879,24 @@ def format_day_button_label(due_date_str: str) -> str:
         return f"📆 На {wd_acc} ({short_date})"
 
 
-# --- ДЕТСКОЕ МЕНЮ ---
+# --- ДЕТСКОЕ МЕНЮ (МГНОВЕННАЯ РАБОТА ИЗ КЭША) ---
 
 async def get_active_child_hw(student_name: str):
-    res = await gas_request({"action": "get_hw", "student": student_name})
-    if not res or res.get("status") != "ok":
-        return []
+    if not HW_CACHE:
+        await refresh_hw_cache_from_gas()
+
+    student_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
+    if not student_items:
+        parsed = await fetch_avers(student_name)
+        if parsed:
+            hw_list, grades_list = parsed
+            merge_avers_into_cache(student_name, hw_list)
+            asyncio.create_task(bg_sync_student_to_gas(student_name, hw_list, grades_list))
+            student_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
 
     today = datetime.now(MOSCOW_TZ).date()
     active = []
-    for item in res.get("items", []):
+    for item in student_items:
         status = item.get("status", "new")
         if status not in ("new", "revision"):
             continue
@@ -609,11 +907,21 @@ async def get_active_child_hw(student_name: str):
             if due_dt >= today or status == "revision":
                 active.append(item)
         except ValueError:
-            # Если дата урока неизвестна, держим задание в списке не дольше 14 дней с даты выдачи
             if status == "revision" or is_recent_date(item.get("given_date", ""), max_days=14):
                 active.append(item)
 
     return active
+
+
+async def get_hw_item_fast(hw_id: str):
+    if hw_id in HW_CACHE:
+        return HW_CACHE[hw_id]
+    res = await gas_request({"action": "get_item", "id": hw_id}, retries=1)
+    if res and res.get("status") == "ok" and res.get("item"):
+        HW_CACHE[hw_id] = res["item"]
+        save_hw_cache()
+        return res["item"]
+    return None
 
 
 async def build_child_days_view(student_name: str):
@@ -670,11 +978,10 @@ async def build_child_subjects_view(student_name: str, due_date_str: str):
 
 
 async def build_child_item_view(student_name: str, hw_id: str):
-    res = await gas_request({"action": "get_item", "id": hw_id})
-    if not res or res.get("status") != "ok":
+    item = await get_hw_item_fast(hw_id)
+    if not item:
         return "😕 Задание не найдено.", [[cb_btn("⬅️ К списку дней", "child_days")]]
 
-    item = res["item"]
     due_date = item["due_date"]
     text = f"<b>{item['subject']}</b> (🗓 на {due_date})\n\n{item['text']}"
 
@@ -725,9 +1032,8 @@ async def handle_text_or_media_message(message: dict):
     text = (body.get("text") or "").strip()
     attachments = body.get("attachments") or []
 
-    # Сброс зависших состояний при вызове команд старта или отмены
     if text.lower() in ("/start", "старт", "меню", "отмена"):
-        USER_STATES.pop(user_id, None)
+        pop_user_state(user_id)
 
     # 1. Проверка активных состояний
     if user_id in USER_STATES:
@@ -737,13 +1043,20 @@ async def handle_text_or_media_message(message: dict):
         # Сценарий: ребенок загружает фотографии выполненной домашки
         if st_type == "waiting_hw_photos":
             hw_id = state_data["hw_id"]
-            image_tokens = []
+            found_media = []
             for att in attachments:
-                if att.get("type") == "image" and att.get("payload", {}).get("token"):
-                    image_tokens.append(att["payload"]["token"])
+                att_type = att.get("type")
+                pl = att.get("payload") or {}
+                if att_type in ("image", "file") and (pl.get("token") or pl.get("url")):
+                    found_media.append({
+                        "type": att_type,
+                        "token": pl.get("token", ""),
+                        "url": pl.get("url", "")
+                    })
 
-            if image_tokens:
-                state_data["photos"].extend(image_tokens)
+            if found_media:
+                state_data["photos"].extend(found_media)
+                save_user_states()
                 total = len(state_data["photos"])
                 buttons = [
                     [cb_btn(f"🚀 Отправить на проверку ({total} фото)", f"c_submit:{hw_id}")],
@@ -769,10 +1082,13 @@ async def handle_text_or_media_message(message: dict):
             hw_id = state_data["hw_id"]
             media_to_forward = []
             for att in attachments:
-                if att.get("type") in ("audio", "file", "image", "video") and att.get("payload", {}).get("token"):
+                att_type = att.get("type")
+                pl = att.get("payload") or {}
+                if att_type in ("audio", "file", "image", "video") and (pl.get("token") or pl.get("url")):
                     media_to_forward.append({
-                        "type": att["type"],
-                        "payload": {"token": att["payload"]["token"]}
+                        "type": att_type,
+                        "token": pl.get("token", ""),
+                        "url": pl.get("url", "")
                     })
 
             if not text and not media_to_forward:
@@ -783,45 +1099,47 @@ async def handle_text_or_media_message(message: dict):
                 )
                 return
 
+            item = await get_hw_item_fast(hw_id)
+            if not item:
+                await send_max_message(user_id, "⚠️ Не удалось найти задание. Попробуйте снова.")
+                return
+
             comment_for_sheet = text if text else "🎤 Голосовое сообщение от бабушки"
-            res = await gas_request({
-                "action": "update_status",
-                "id": hw_id,
-                "status": "revision",
-                "comment": comment_for_sheet
-            })
-            USER_STATES.pop(user_id, None)
+            item["status"] = "revision"
+            item["comment"] = comment_for_sheet
+            HW_CACHE[hw_id] = item
+            save_hw_cache()
+            pop_user_state(user_id)
 
-            if res and res.get("status") == "ok":
-                item = res["item"]
-                student_name = item["student"]
-                s_info = STUDENTS.get(student_name, {})
-                child_nom = s_info.get("nominative", "Ребенок")
-                child_id = s_info.get("child_user_id")
-                await send_max_message(
-                    user_id,
-                    f"📨 Спасибо! Ваше замечание отправлено. Задание по предмету <b>{item['subject']}</b> ({student_name}) возвращено на доработку.",
-                    build_adult_main_menu(user_id)[1]
+            asyncio.create_task(bg_update_gas_status(hw_id, status="revision", comment=comment_for_sheet))
+
+            student_name = item["student"]
+            s_info = STUDENTS.get(student_name, {})
+            child_nom = s_info.get("nominative", "Ребенок")
+            child_id = s_info.get("child_user_id")
+
+            await send_max_message(
+                user_id,
+                f"📨 Спасибо! Ваше замечание отправлено. Задание по предмету <b>{item['subject']}</b> ({student_name}) возвращено на доработку.",
+                build_adult_main_menu(user_id)[1]
+            )
+            if child_id:
+                child_msg = (
+                    f"🧐 {child_nom}, бабушка Наташа проверила твою работу по предмету <b>{item['subject']}</b> "
+                    f"(на {item['due_date']}) и попросила кое-что подправить.\n\n"
+                    f"<b>Задание:</b>\n{item['text']}"
                 )
-                if child_id:
-                    child_msg = (
-                        f"🧐 {child_nom}, бабушка Наташа проверила твою работу по предмету <b>{item['subject']}</b> "
-                        f"(на {item['due_date']}) и попросила кое-что подправить.\n\n"
-                        f"<b>Задание:</b>\n{item['text']}"
-                    )
-                    if text:
-                        child_msg += f"\n\n💬 <b>Замечание бабушки:</b>\n<i>{html.escape(text)}</i>"
-                    elif media_to_forward:
-                        child_msg += "\n\n🎧 <i>Прослушай голосовое замечание от бабушки во вложении!</i>"
+                if text:
+                    child_msg += f"\n\n💬 <b>Замечание бабушки:</b>\n<i>{html.escape(text)}</i>"
+                elif media_to_forward:
+                    child_msg += "\n\n🎧 <i>Прослушай голосовое замечание от бабушки во вложении!</i>"
 
-                    await send_max_message(
-                        child_id,
-                        child_msg,
-                        [[cb_btn("🛠 Перейти к исправлению", f"c_hw:{hw_id}")]],
-                        extra_attachments=media_to_forward
-                    )
-            else:
-                await send_max_message(user_id, "⚠️ Не удалось обновить статус в таблице. Попробуйте еще раз.")
+                await send_max_message(
+                    child_id,
+                    child_msg,
+                    [[cb_btn("🛠 Перейти к исправлению", f"c_hw:{hw_id}")]],
+                    extra_attachments=media_to_forward
+                )
             return
 
         # Сценарий: ввод начальной даты для оценок
@@ -836,6 +1154,7 @@ async def handle_text_or_media_message(message: dict):
                 return
             state_data["start_date"] = date_str
             state_data["state"] = "waiting_end_date"
+            save_user_states()
             await send_max_message(
                 user_id,
                 "🗓 Отлично! Теперь введите конечную дату в формате ДД.ММ.ГГГГ:",
@@ -855,9 +1174,8 @@ async def handle_text_or_media_message(message: dict):
                 return
             start_date = state_data["start_date"]
             student_name = state_data["student_name"]
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
 
-            # Автоматическая корректировка порядка дат, если конечная дата раньше начальной
             dt_start = datetime.strptime(start_date, "%d.%m.%Y")
             dt_end = datetime.strptime(end_date, "%d.%m.%Y")
             if dt_end < dt_start:
@@ -886,7 +1204,13 @@ async def handle_text_or_media_message(message: dict):
 
     child_student = get_child_student_name(user_id)
     if child_student:
+        has_photo = any(att.get("type") in ("image", "file") for att in attachments)
         msg_text, buttons = await build_child_days_view(child_student)
+        if has_photo:
+            msg_text = (
+                "📸 Вижу фотографию! Чтобы сдать домашку бабушке на проверку, сначала выбери ниже день "
+                "и предмет, а внутри него нажми кнопку <b>«Я завершил!»</b> 👇"
+            )
         await send_max_message(user_id, msg_text, buttons)
         return
 
@@ -909,49 +1233,49 @@ async def handle_callback_event(update: dict):
         is_female = s_info.get("gender") == "f"
 
         if payload == "child_days":
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
             text, buttons = await build_child_days_view(child_student)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("c_day:"):
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
             due_date = payload.split(":", 1)[1]
             text, buttons = await build_child_subjects_view(child_student, due_date)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("c_hw:"):
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
             hw_id = payload.split(":", 1)[1]
             text, buttons = await build_child_item_view(child_student, hw_id)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("c_done:"):
             hw_id = payload.split(":", 1)[1]
-            USER_STATES[user_id] = {
+            set_user_state(user_id, {
                 "state": "waiting_hw_photos",
                 "hw_id": hw_id,
                 "photos": []
-            }
+            })
             prompt_text = (
                 f"📸 Ну-ка, {child_nom}, подгрузи выполненную домашку!\n"
                 f"Сфотографируй тетрадь и отправь фото в этот чат (можно несколько страниц подряд).\n\n"
                 f"Когда загрузишь все страницы, нажми кнопку отправки на проверку 👇"
             )
-            await answer_max_callback(callback_id, text=prompt_text, buttons=[[cb_btn("❌ Отмена", f"c_hw:{hw_id}")]])
+            await answer_max_callback(callback_id, user_id=user_id, text=prompt_text, buttons=[[cb_btn("❌ Отмена", f"c_hw:{hw_id}")]])
             return
 
         if payload.startswith("c_submit:"):
             hw_id = payload.split(":", 1)[1]
             st_data = USER_STATES.get(user_id)
 
-            # Защита от повторного нажатия кнопки отправки на старых сообщениях
             if not st_data or st_data.get("state") != "waiting_hw_photos" or st_data.get("hw_id") != hw_id:
                 text, buttons = await build_child_days_view(child_student)
                 await answer_max_callback(
                     callback_id,
+                    user_id=user_id,
                     text=text,
                     buttons=buttons,
                     notification="ℹ️ Это задание уже отправлено на проверку!"
@@ -960,37 +1284,20 @@ async def handle_callback_event(update: dict):
 
             photos = st_data.get("photos", [])
             if not photos:
-                await answer_max_callback(callback_id, notification="📷 Сначала отправь хотя бы одно фото тетради!")
+                await answer_max_callback(callback_id, user_id=user_id, notification="📷 Сначала отправь хотя бы одно фото тетради!")
                 return
 
-            USER_STATES.pop(user_id, None)
-            res = await gas_request({
-                "action": "update_status",
-                "id": hw_id,
-                "status": "pending",
-                "photos": json.dumps(photos)
-            })
-
-            if not res or res.get("status") != "ok":
+            item = await get_hw_item_fast(hw_id)
+            if not item:
                 await answer_max_callback(
                     callback_id,
-                    text="⚠️ Ошибка сохранения. Попробуй еще раз.",
-                    buttons=[[cb_btn("⬅️ Назад", f"c_hw:{hw_id}")]]
+                    user_id=user_id,
+                    text="⚠️ Не удалось найти карточку задания. Попробуй открыть предмет заново.",
+                    buttons=[[cb_btn("📚 К списку дней", "child_days")]]
                 )
                 return
 
-            item = res["item"]
-            praise_word = "Умница" if is_female else "Красавчик"
-            await answer_max_callback(
-                callback_id,
-                text=(
-                    f"🎉 {praise_word}, {child_nom}! Домашка по предмету <b>{item['subject']}</b> "
-                    f"улетела бабушке Наташе на проверку. Ждем результат! 🤞"
-                ),
-                buttons=[[cb_btn("📚 К остальным заданиям", "child_days")]]
-            )
-
-            # Пересылка отчета бабушке Наташе
+            # Сначала отправляем фотографии бабушке Наташе, не стирая их из памяти заранее
             reviewer_id = s_info.get("reviewer_id")
             if reviewer_id:
                 rel_label = "👧 Внучка" if is_female else "👦 Внук"
@@ -1001,54 +1308,96 @@ async def handle_callback_event(update: dict):
                     f"{item['text']}\n\n"
                     f"Посмотрите фотографии ниже и выберите решение 👇"
                 )
-                img_attachments = [{"type": "image", "payload": {"token": t}} for t in photos[:11]]
                 gm_buttons = [[
                     cb_btn("✅ Подтвердить", f"gm_ok:{hw_id}"),
                     cb_btn("✏️ На доработку", f"gm_rev:{hw_id}")
                 ]]
-                await send_max_message(reviewer_id, gm_text, gm_buttons, extra_attachments=img_attachments)
+                sent_ok = await send_max_message(reviewer_id, gm_text, gm_buttons, extra_attachments=photos)
+                if not sent_ok:
+                    await answer_max_callback(
+                        callback_id,
+                        user_id=user_id,
+                        text="⚠️ Связь на секунду моргнула, фотографии сохранены. Нажми кнопку отправки еще раз 👇",
+                        buttons=[
+                            [cb_btn(f"🚀 Повторить отправку ({len(photos)} фото)", f"c_submit:{hw_id}")],
+                            [cb_btn("❌ Отмена", f"c_hw:{hw_id}")]
+                        ]
+                    )
+                    return
+
+            # Фиксируем сдачу в локальном кэше и очищаем состояние только после доставки
+            pop_user_state(user_id)
+            photos_tokens = [p["token"] if isinstance(p, dict) else str(p) for p in photos]
+            photos_json = json.dumps(photos_tokens, ensure_ascii=False)
+            item["status"] = "pending"
+            item["photos"] = photos_json
+            HW_CACHE[hw_id] = item
+            save_hw_cache()
+
+            asyncio.create_task(bg_update_gas_status(hw_id, status="pending", photos=photos_json))
+
+            praise_word = "Умница" if is_female else "Красавчик"
+            await answer_max_callback(
+                callback_id,
+                user_id=user_id,
+                text=(
+                    f"🎉 {praise_word}, {child_nom}! Домашка по предмету <b>{item['subject']}</b> "
+                    f"улетела бабушке Наташе на проверку. Ждем результат! 🤞"
+                ),
+                buttons=[[cb_btn("📚 К остальным заданиям", "child_days")]]
+            )
             return
 
     # --- НАВИГАЦИЯ ВЗРОСЛЫХ И ПРОВЕРКА БАБУШКОЙ ---
     if user_id in ADULT_ACCESS:
         if payload == "adult_menu":
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
             text, buttons = build_adult_main_menu(user_id)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("gm_ok:"):
             hw_id = payload.split(":", 1)[1]
-            res = await gas_request({"action": "update_status", "id": hw_id, "status": "done"})
-            if res and res.get("status") == "ok":
-                item = res["item"]
-                s_name = item["student"]
-                s_info = STUDENTS.get(s_name, {})
-                child_nom = s_info.get("nominative", "Ребенок")
-                champ_word = "чемпионка" if s_info.get("gender") == "f" else "чемпион"
-                await answer_max_callback(
-                    callback_id,
-                    text=(
-                        f"✅ <b>Выполнение подтверждено!</b>\n"
-                        f"Предмет: <b>{item['subject']}</b> ({child_nom}, на {item['due_date']}).\n"
-                        f"Спасибо за проверку, бабушка Наташа! 🌺"
-                    ),
-                    buttons=[[cb_btn("🏠 В главное меню", "adult_menu")]]
+            item = await get_hw_item_fast(hw_id)
+            if not item:
+                await answer_max_callback(callback_id, user_id=user_id, notification="⚠️ Задание не найдено")
+                return
+
+            item["status"] = "done"
+            HW_CACHE[hw_id] = item
+            save_hw_cache()
+            asyncio.create_task(bg_update_gas_status(hw_id, status="done"))
+
+            s_name = item["student"]
+            s_info = STUDENTS.get(s_name, {})
+            child_nom = s_info.get("nominative", "Ребенок")
+            champ_word = "чемпионка" if s_info.get("gender") == "f" else "чемпион"
+
+            await answer_max_callback(
+                callback_id,
+                user_id=user_id,
+                text=(
+                    f"✅ <b>Выполнение подтверждено!</b>\n"
+                    f"Предмет: <b>{item['subject']}</b> ({child_nom}, на {item['due_date']}).\n"
+                    f"Спасибо за проверку, бабушка Наташа! 🌺"
+                ),
+                buttons=[[cb_btn("🏠 В главное меню", "adult_menu")]]
+            )
+            child_id = s_info.get("child_user_id")
+            if child_id:
+                await send_max_message(
+                    child_id,
+                    f"🥳 Ура, {child_nom}! Бабушка Наташа проверила и подтвердила твою домашку по предмету <b>{item['subject']}</b>! Так держать, {champ_word}! 🏆",
+                    [[cb_btn("📚 К заданиям", "child_days")]]
                 )
-                child_id = s_info.get("child_user_id")
-                if child_id:
-                    await send_max_message(
-                        child_id,
-                        f"🥳 Ура, {child_nom}! Бабушка Наташа проверила и подтвердила твою домашку по предмету <b>{item['subject']}</b>! Так держать, {champ_word}! 🏆",
-                        [[cb_btn("📚 К заданиям", "child_days")]]
-                    )
             return
 
         if payload.startswith("gm_rev:"):
             hw_id = payload.split(":", 1)[1]
-            USER_STATES[user_id] = {"state": "waiting_gm_comment", "hw_id": hw_id}
+            set_user_state(user_id, {"state": "waiting_gm_comment", "hw_id": hw_id})
             await answer_max_callback(
                 callback_id,
+                user_id=user_id,
                 text=(
                     "✍️ Бабушка Наташа, напишите текстом или отправьте голосовое сообщение в этот чат: "
                     "подскажите, что именно нужно исправить или доделать 👇"
@@ -1058,50 +1407,48 @@ async def handle_callback_event(update: dict):
             return
 
         if payload.startswith("gm_cancel:"):
-            USER_STATES.pop(user_id, None)
+            pop_user_state(user_id)
             text, buttons = build_adult_main_menu(user_id)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("a_hw:"):
             student_name = payload.split(":", 1)[1]
             if student_name not in ADULT_ACCESS[user_id]:
                 return
-            await answer_max_callback(callback_id, notification=f"⏳ Загружаю ДЗ ({student_name})...")
-
-            parsed = await fetch_avers(student_name)
-            if not parsed:
-                await send_max_message(user_id, "😕 Не удалось получить данные из дневника.", build_adult_main_menu(user_id)[1])
-                return
-
-            hw_list, grades_list = parsed
-            await gas_request({
-                "action": "sync",
-                "student": student_name,
-                "hw_list": hw_list,
-                "grades_list": grades_list
-            })
-
-            sheet_res = await gas_request({"action": "get_hw", "student": student_name})
-            status_map = {}
-            if sheet_res and sheet_res.get("status") == "ok":
-                for s_item in sheet_res.get("items", []):
-                    status_map[s_item["id"]] = s_item.get("status", "new")
+            await answer_max_callback(callback_id, user_id=user_id, notification=f"⏳ Загружаю ДЗ ({student_name})...")
 
             today_start = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
             week_start = (today_start - timedelta(days=today_start.weekday())).date()
 
+            parsed = await fetch_avers(student_name)
+            title_prefix = f"📚 Текущие задания ({student_name}):"
+
+            if parsed:
+                hw_list, grades_list = parsed
+                merge_avers_into_cache(student_name, hw_list)
+                asyncio.create_task(bg_sync_student_to_gas(student_name, hw_list, grades_list))
+                source_items = [HW_CACHE.get(h["id"], h) for h in hw_list]
+            else:
+                # Если школьный сайт выдал 502, отдаем задания из локального кэша
+                source_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
+                if not source_items:
+                    await send_max_message(user_id, "😕 Школьный дневник временно недоступен (ошибка сервера школы).", build_adult_main_menu(user_id)[1])
+                    return
+                title_prefix = f"⚠️ Дневник временно недоступен, сохраненные задания ({student_name}):"
+
             filtered_hw = []
-            for h in hw_list:
-                h["status"] = status_map.get(h["id"], "new")
+            for h in source_items:
+                item_copy = dict(h)
+                item_copy["status"] = HW_CACHE.get(h["id"], {}).get("status", h.get("status", "new"))
                 try:
-                    g_dt = datetime.strptime(h["given_date"], "%d.%m.%Y").date()
-                    d_dt = datetime.strptime(h["due_date"], "%d.%m.%Y").date()
+                    g_dt = datetime.strptime(item_copy["given_date"], "%d.%m.%Y").date()
+                    d_dt = datetime.strptime(item_copy["due_date"], "%d.%m.%Y").date()
                     if g_dt >= week_start or d_dt >= week_start:
-                        filtered_hw.append(h)
+                        filtered_hw.append(item_copy)
                 except ValueError:
-                    if is_recent_date(h.get("given_date", ""), max_days=14):
-                        filtered_hw.append(h)
+                    if is_recent_date(item_copy.get("given_date", ""), max_days=14):
+                        filtered_hw.append(item_copy)
 
             show_st = STUDENTS[student_name].get("can_submit", False)
             if not filtered_hw:
@@ -1111,7 +1458,7 @@ async def handle_callback_event(update: dict):
                     build_adult_main_menu(user_id)[1]
                 )
             else:
-                report = format_hw_message(filtered_hw, f"📚 Текущие задания ({student_name}):", show_status=show_st)
+                report = format_hw_message(filtered_hw, title_prefix, show_status=show_st)
                 await send_max_message(user_id, report, build_adult_main_menu(user_id)[1])
             return
 
@@ -1120,14 +1467,14 @@ async def handle_callback_event(update: dict):
             if student_name not in ADULT_ACCESS[user_id]:
                 return
             text, buttons = build_adult_grades_menu(student_name)
-            await answer_max_callback(callback_id, text=text, buttons=buttons)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("a_gr_week:"):
             student_name = payload.split(":", 1)[1]
             if student_name not in ADULT_ACCESS[user_id]:
                 return
-            await answer_max_callback(callback_id, notification=f"⏳ Загружаю оценки ({student_name})...")
+            await answer_max_callback(callback_id, user_id=user_id, notification=f"⏳ Загружаю оценки ({student_name})...")
 
             today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
             start_of_week = (today - timedelta(days=today.weekday())).strftime("%d.%m.%Y")
@@ -1152,9 +1499,10 @@ async def handle_callback_event(update: dict):
             student_name = payload.split(":", 1)[1]
             if student_name not in ADULT_ACCESS[user_id]:
                 return
-            USER_STATES[user_id] = {"state": "waiting_start_date", "student_name": student_name}
+            set_user_state(user_id, {"state": "waiting_start_date", "student_name": student_name})
             await answer_max_callback(
                 callback_id,
+                user_id=user_id,
                 text=f"🗓 Введите начальную дату для оценок ({student_name}) в формате ДД.ММ.ГГГГ (например, 01.09.2026):",
                 buttons=[[cb_btn("❌ Отмена", "adult_menu")]]
             )
@@ -1173,18 +1521,21 @@ async def check_and_send():
             continue
 
         hw_list, grades_list = parsed
+        merge_avers_into_cache(student_name, hw_list)
+
         sync_res = await gas_request({
             "action": "sync",
             "student": student_name,
             "hw_list": hw_list,
             "grades_list": grades_list
-        })
+        }, retries=2)
 
-        if not sync_res or sync_res.get("status") != "ok":
-            continue
+        new_hw = []
+        new_grades = []
+        if sync_res and sync_res.get("status") == "ok":
+            new_hw = sync_res.get("new_hw", [])
+            new_grades = sync_res.get("new_grades", [])
 
-        new_hw = sync_res.get("new_hw", [])
-        new_grades = sync_res.get("new_grades", [])
         adult_chats = student_data.get("adult_notify", [])
         child_nom = student_data.get("nominative", "")
 
@@ -1199,18 +1550,13 @@ async def check_and_send():
             for uid in adult_chats:
                 await send_max_message(uid, report_gr, build_adult_main_menu(uid)[1])
 
-        # 2. Детям уведомления уходят только начиная с 14:00
+        # 2. Детям уведомления уходят начиная с 14:00
         child_id = student_data.get("child_user_id")
         if child_id and current_hour >= 14:
-            unnotified_res = await gas_request({
-                "action": "get_hw",
-                "student": student_name,
-                "only_unnotified": True
-            })
-
-            unnotified_items = []
-            if unnotified_res and unnotified_res.get("status") == "ok":
-                unnotified_items = unnotified_res.get("items", [])
+            unnotified_items = [
+                v for v in HW_CACHE.values()
+                if v.get("student") == student_name and v.get("notified_child") == "no"
+            ]
 
             if current_hour == 14:
                 active_items = await get_active_child_hw(student_name)
@@ -1219,9 +1565,13 @@ async def check_and_send():
                         f"🐦 Чирик, котик линтеха! {child_nom}, тебе пришла новая домашка, "
                         f"приступишь к выполнению? 💪✨"
                     )
-                    await send_max_message(child_id, msg_14, [[cb_btn("🚀 Перейти к заданиям", "child_days")]])
-                    ids_to_mark = [i["id"] for i in unnotified_items]
-                    await gas_request({"action": "mark_notified", "ids": ids_to_mark})
+                    if await send_max_message(child_id, msg_14, [[cb_btn("🚀 Перейти к заданиям", "child_days")]]):
+                        ids_to_mark = [i["id"] for i in unnotified_items]
+                        for hid in ids_to_mark:
+                            if hid in HW_CACHE:
+                                HW_CACHE[hid]["notified_child"] = "yes"
+                        save_hw_cache()
+                        asyncio.create_task(gas_request({"action": "mark_notified", "ids": ids_to_mark}, retries=2))
                 elif active_items:
                     msg_rem = (
                         f"🐦 Чирик, котик линтеха! {child_nom}, напоминаю, что у тебя есть "
@@ -1234,11 +1584,17 @@ async def check_and_send():
                     f"🔔 Вжух, {child_nom}! Из школы прилетела еще одна новая домашка. "
                     f"Загляни в общий раздел! 👀"
                 )
-                await send_max_message(child_id, msg_late, [[cb_btn("📂 Перейти к заданиям", "child_days")]])
-                ids_to_mark = [i["id"] for i in unnotified_items]
-                await gas_request({"action": "mark_notified", "ids": ids_to_mark})
+                if await send_max_message(child_id, msg_late, [[cb_btn("📂 Перейти к заданиям", "child_days")]]):
+                    ids_to_mark = [i["id"] for i in unnotified_items]
+                    for hid in ids_to_mark:
+                        if hid in HW_CACHE:
+                            HW_CACHE[hid]["notified_child"] = "yes"
+                    save_hw_cache()
+                    asyncio.create_task(gas_request({"action": "mark_notified", "ids": ids_to_mark}, retries=2))
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
+
+    await refresh_hw_cache_from_gas()
 
 
 # --- ЦИКЛ ПОЛУЧЕНИЯ ОБНОВЛЕНИЙ MAX (LONG POLLING) ---
@@ -1255,13 +1611,19 @@ def _sync_get_updates(marker):
         resp = POLL_SESSION.get(f"{MAX_API_URL}/updates", headers=max_headers(), params=params, timeout=35)
         if resp.status_code == 200:
             return resp.json()
-        else:
-            logging.error(f"Статус ответа /updates: {resp.status_code} - {resp.text}")
+        logging.error(f"Статус ответа /updates: {resp.status_code} - {resp.text}")
     except requests.exceptions.Timeout:
         return None
     except Exception as e:
         logging.error(f"Ошибка опроса /updates: {e}")
     return None
+
+
+async def _safe_dispatch(coro, u_type: str):
+    try:
+        await coro
+    except Exception as e:
+        logging.error(f"Ошибка обработки события {u_type}: {e}")
 
 
 async def poll_max_updates():
@@ -1280,22 +1642,25 @@ async def poll_max_updates():
         updates = data.get("updates") or []
         for upd in updates:
             u_type = upd.get("update_type")
-            try:
-                if u_type == "bot_started":
-                    user = upd.get("user") or {}
-                    uid = user.get("user_id")
-                    if uid:
-                        await handle_text_or_media_message({"sender": {"user_id": uid}, "body": {"text": "/start"}})
-                elif u_type == "message_created":
-                    msg = upd.get("message") or {}
-                    await handle_text_or_media_message(msg)
-                elif u_type == "message_callback":
-                    await handle_callback_event(upd)
-            except Exception as e:
-                logging.error(f"Ошибка обработки события {u_type}: {e}")
+            if u_type == "bot_started":
+                user = upd.get("user") or {}
+                uid = user.get("user_id")
+                if uid:
+                    asyncio.create_task(_safe_dispatch(
+                        handle_text_or_media_message({"sender": {"user_id": uid}, "body": {"text": "/start"}}),
+                        u_type
+                    ))
+            elif u_type == "message_created":
+                msg = upd.get("message") or {}
+                asyncio.create_task(_safe_dispatch(handle_text_or_media_message(msg), u_type))
+            elif u_type == "message_callback":
+                asyncio.create_task(_safe_dispatch(handle_callback_event(upd), u_type))
 
 
 async def main():
+    load_local_data()
+    asyncio.create_task(refresh_hw_cache_from_gas())
+
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(check_and_send, "cron", hour="12-20", minute=0)
     scheduler.start()
