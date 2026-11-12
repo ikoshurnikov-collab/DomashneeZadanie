@@ -42,11 +42,24 @@ ID_NIKITA = 200548363
 ID_ANYA = int(os.getenv("ID_ANYA", "0"))
 ID_NASTYA = int(os.getenv("ID_NASTYA", "0"))
 
+# Раздельные права взрослых на просмотр ДЗ и оценок
 ADULT_ACCESS = {
-    ID_IGOR: ["Кирилла", "Никиты", "Ани", "Насти"],
-    ID_KATYA: ["Кирилла", "Никиты"],
-    ID_GRANDMA: ["Кирилла", "Никиты"],
-    ID_OLYA: ["Ани", "Насти"]
+    ID_IGOR: {
+        "hw": ["Кирилла", "Никиты"],
+        "grades": ["Кирилла", "Никиты", "Ани", "Насти"]
+    },
+    ID_KATYA: {
+        "hw": ["Кирилла", "Никиты"],
+        "grades": ["Кирилла", "Никиты"]
+    },
+    ID_GRANDMA: {
+        "hw": ["Кирилла", "Никиты"],
+        "grades": ["Кирилла", "Никиты"]
+    },
+    ID_OLYA: {
+        "hw": ["Ани", "Насти"],
+        "grades": ["Ани", "Насти"]
+    }
 }
 
 ADULT_GREETINGS = {
@@ -155,6 +168,8 @@ STUDENTS = {
     }
 }
 
+KEY_TO_STUDENT = {v["key"]: k for k, v in STUDENTS.items()}
+
 SUBJECTS = {
     1: "✍️ Русский язык",
     2: "📖 Литературное чтение",
@@ -204,6 +219,13 @@ WEEKDAYS_SHORT = {
 
 HW_CACHE = {}
 USER_STATES = {}
+INITIAL_GAS_SYNCED = False
+
+
+def resolve_student_name(token: str):
+    if token in STUDENTS:
+        return token
+    return KEY_TO_STUDENT.get(token)
 
 
 # --- ЛОКАЛЬНЫЙ КЭШ НА ДИСКЕ ---
@@ -273,7 +295,8 @@ def merge_avers_into_cache(student_name: str, hw_list: list):
                 "status": "new",
                 "notified_child": "no",
                 "photos": "",
-                "comment": ""
+                "comment": "",
+                "gas_synced": True
             }
             changed = True
         else:
@@ -293,8 +316,21 @@ def merge_gas_items_into_cache(items: list):
         return
     for item in items:
         hid = item.get("id")
-        if hid:
-            HW_CACHE[hid] = item
+        if not hid:
+            continue
+        local_existing = HW_CACHE.get(hid)
+        if local_existing and local_existing.get("gas_synced") is False:
+            merged = dict(item)
+            merged["status"] = local_existing.get("status", item.get("status", "new"))
+            merged["photos"] = local_existing.get("photos", item.get("photos", ""))
+            merged["comment"] = local_existing.get("comment", item.get("comment", ""))
+            merged["notified_child"] = local_existing.get("notified_child", item.get("notified_child", "no"))
+            merged["gas_synced"] = False
+            HW_CACHE[hid] = merged
+        else:
+            item_copy = dict(item)
+            item_copy["gas_synced"] = True
+            HW_CACHE[hid] = item_copy
     save_hw_cache()
 
 
@@ -433,12 +469,13 @@ def _reupload_media_from_url(media_url: str, media_type: str):
 
 
 def _send_with_attachment_retry(user_id: int, body: dict) -> bool:
-    for attempt in range(3):
+    delays = [1.5, 3.0, 5.0]
+    for attempt in range(4):
         resp = _post_max_raw(user_id, body)
         if resp.status_code == 200:
             return True
-        if "attachment.not.ready" in resp.text and attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
+        if ("attachment.not.ready" in resp.text or "not.processed" in resp.text) and attempt < 3:
+            time.sleep(delays[attempt])
             continue
         logging.warning(f"MAX отклонил отправку ({resp.status_code}) для {user_id}: {resp.text}")
         return False
@@ -449,7 +486,6 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
     chunks = split_html_text(text, max_len=3800)
 
     try:
-        # Отправляем все промежуточные части длинного текста без кнопок
         for part in chunks[:-1]:
             resp = _post_max_raw(user_id, {"text": part, "format": "html"})
             if resp.status_code != 200:
@@ -457,7 +493,6 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
 
         last_text = chunks[-1]
 
-        # Обычное сообщение без медиафайлов
         if not media_items:
             body = {"text": last_text, "format": "html"}
             if buttons:
@@ -468,7 +503,6 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
                 return False
             return True
 
-        # Нормализация списка медиавложений
         normalized = []
         for m in media_items[:11]:
             if isinstance(m, str):
@@ -480,7 +514,6 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
                     "url": m.get("url", "")
                 })
 
-        # Попытка 1: отправка по токену вложения
         token_atts = [{"type": m["type"], "payload": {"token": m["token"]}} for m in normalized if m.get("token")]
         if token_atts:
             atts = list(token_atts) + ([make_keyboard(buttons)] if buttons else [])
@@ -491,14 +524,12 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
                     _post_max_raw(user_id, {"text": "Выберите действие 👇", "format": "html", "attachments": [make_keyboard(buttons)]})
                     return True
 
-        # Попытка 2: отправка изображений напрямую по URL
         url_atts = [{"type": "image", "payload": {"url": m["url"]}} for m in normalized if m["type"] == "image" and m.get("url")]
         if url_atts and len(url_atts) == len(normalized):
             atts = list(url_atts) + ([make_keyboard(buttons)] if buttons else [])
             if _send_with_attachment_retry(user_id, {"text": last_text, "format": "html", "attachments": atts}):
                 return True
 
-        # Попытка 3: перезагрузка медиафайлов от имени самого бота через POST /uploads
         reuploaded_atts = []
         for m in normalized:
             re_att = _reupload_media_from_url(m.get("url", ""), m["type"])
@@ -515,7 +546,7 @@ def _sync_send_message(user_id: int, text: str, buttons=None, media_items=None) 
                     _post_max_raw(user_id, {"text": "Выберите действие 👇", "format": "html", "attachments": [make_keyboard(buttons)]})
                     return True
 
-        logging.error(f"Не удалось доставить медиавложения пользователю {user_id} ни одним из способов")
+        logging.error(f"Не удалось доставить медиавложения пользователю {user_id}")
         return False
 
     except Exception as e:
@@ -528,13 +559,27 @@ async def send_max_message(user_id: int, text: str, buttons=None, extra_attachme
 
 
 def _sync_answer_callback(callback_id: str, user_id: int = None, text: str = None, buttons=None, notification: str = None):
+    if text is not None and len(text) > 3800 and user_id:
+        try:
+            ack_body = {"notification": notification} if notification else {}
+            requests.post(
+                f"{MAX_API_URL}/answers",
+                params={"callback_id": callback_id},
+                headers=max_headers(),
+                json=ack_body,
+                timeout=10
+            )
+        except Exception:
+            pass
+        _sync_send_message(user_id, text, buttons=buttons)
+        return
+
     body = {}
     if notification:
         body["notification"] = notification
     if text is not None:
-        safe_text = text if len(text) <= 3900 else (text[:3890] + "...")
         body["message"] = {
-            "text": safe_text,
+            "text": text,
             "format": "html",
             "attachments": [make_keyboard(buttons)] if buttons else []
         }
@@ -591,10 +636,44 @@ async def gas_request(payload: dict, retries: int = 2):
         return await asyncio.to_thread(_sync_gas_request, payload, retries)
 
 
+async def push_unsynced_to_gas():
+    unsynced_ids = [hid for hid, item in HW_CACHE.items() if item.get("gas_synced") is False]
+    if not unsynced_ids:
+        return
+
+    notified_batch = []
+    for hid in unsynced_ids:
+        item = HW_CACHE.get(hid)
+        if not item:
+            continue
+        st = item.get("status", "new")
+        ph = item.get("photos", "")
+        cm = item.get("comment", "")
+        res = await gas_request({
+            "action": "update_status",
+            "id": hid,
+            "status": st,
+            "photos": ph,
+            "comment": cm
+        }, retries=1)
+        if res and res.get("status") == "ok":
+            if item.get("notified_child") == "yes":
+                notified_batch.append(hid)
+            if HW_CACHE.get(hid, {}).get("status") == st and HW_CACHE.get(hid, {}).get("comment") == cm:
+                HW_CACHE[hid]["gas_synced"] = True
+
+    if notified_batch:
+        await gas_request({"action": "mark_notified", "ids": notified_batch}, retries=1)
+    save_hw_cache()
+
+
 async def refresh_hw_cache_from_gas():
+    global INITIAL_GAS_SYNCED
+    await push_unsynced_to_gas()
     res = await gas_request({"action": "get_hw"}, retries=2)
     if res and res.get("status") == "ok":
         merge_gas_items_into_cache(res.get("items", []))
+        INITIAL_GAS_SYNCED = True
         return True
     return False
 
@@ -607,7 +686,21 @@ async def bg_update_gas_status(hw_id: str, status: str = None, photos: str = Non
         payload["photos"] = photos
     if comment is not None:
         payload["comment"] = comment
-    await gas_request(payload, retries=3)
+    res = await gas_request(payload, retries=3)
+    if res and res.get("status") == "ok" and hw_id in HW_CACHE:
+        cur = HW_CACHE[hw_id]
+        if (status is None or cur.get("status") == status) and (comment is None or cur.get("comment") == comment):
+            cur["gas_synced"] = True
+            save_hw_cache()
+
+
+async def bg_mark_notified_gas(ids_to_mark: list):
+    res = await gas_request({"action": "mark_notified", "ids": ids_to_mark}, retries=2)
+    if res and res.get("status") == "ok":
+        for hid in ids_to_mark:
+            if hid in HW_CACHE and HW_CACHE[hid].get("status") == "new":
+                HW_CACHE[hid]["gas_synced"] = True
+        save_hw_cache()
 
 
 async def bg_sync_student_to_gas(student_name: str, hw_list: list, grades_list: list):
@@ -637,7 +730,7 @@ def validate_date(date_text: str):
         return None
 
 
-def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: str = None):
+def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: str = None, interactive: bool = False):
     student_data = STUDENTS[student_name]
 
     if not start_dt_str or not end_dt_str:
@@ -664,18 +757,21 @@ def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: s
         "Connection": "close"
     }
 
+    max_attempts = 1 if interactive else 2
+    req_timeout = 8 if interactive else 15
+
     response = None
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         try:
-            response = requests.post(DATA_URL, data=payload_data, headers=headers, timeout=15)
+            response = requests.post(DATA_URL, data=payload_data, headers=headers, timeout=req_timeout)
             if response.status_code == 200:
                 break
-            if attempt == 0 and response.status_code >= 500:
+            if attempt == 0 and max_attempts > 1 and response.status_code >= 500:
                 time.sleep(2)
                 continue
         except requests.exceptions.RequestException as e:
             logging.error(f"Сетевая ошибка Аверс ({student_name}): {e}")
-            if attempt == 0:
+            if attempt == 0 and max_attempts > 1:
                 time.sleep(2)
                 continue
             return None
@@ -777,11 +873,11 @@ def _sync_fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: s
     return list(current_hw.values()), list(current_grades.values())
 
 
-async def fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: str = None):
-    return await asyncio.to_thread(_sync_fetch_avers, student_name, start_dt_str, end_dt_str)
+async def fetch_avers(student_name: str, start_dt_str: str = None, end_dt_str: str = None, interactive: bool = False):
+    return await asyncio.to_thread(_sync_fetch_avers, student_name, start_dt_str, end_dt_str, interactive)
 
 
-# --- ФОРМАТИРОВАНИЕ СООБЩЕНИЙ ---
+# --- ФОРМАТИРОВАНИЕ СООБЩЕНИЙ И КНОПОК ---
 
 STATUS_LABELS = {
     "new": "🆕 новое",
@@ -801,6 +897,13 @@ def decorate_grade(grade_str: str) -> str:
     return grade_str
 
 
+def parse_due_date_sort(d: str):
+    try:
+        return datetime.strptime(d, "%d.%m.%Y")
+    except ValueError:
+        return datetime.max
+
+
 def format_hw_message(entries, title, show_status=False):
     if not entries:
         return ""
@@ -811,13 +914,7 @@ def format_hw_message(entries, title, show_status=False):
             grouped[d_date] = []
         grouped[d_date].append(entry)
 
-    def parse_date(d):
-        try:
-            return datetime.strptime(d, "%d.%m.%Y")
-        except ValueError:
-            return datetime.max
-
-    sorted_dates = sorted(grouped.keys(), key=parse_date)
+    sorted_dates = sorted(grouped.keys(), key=parse_due_date_sort)
     msg = f"<b>{title}</b>\n\n"
     for d_date in sorted_dates:
         msg += f"🗓 <b>На {d_date}:</b>\n"
@@ -826,7 +923,32 @@ def format_hw_message(entries, title, show_status=False):
             if show_status and "status" in item:
                 st_label = STATUS_LABELS.get(item["status"], item["status"])
                 st_str = f" [{st_label}]"
-            msg += f"• <b>{item['subject']}</b>{st_str}:\n{item['text']}\n\n"
+            msg += f"• <b>{item['subject']}</b>{st_str}:\n{item['text']}\n"
+            if show_status and item.get("status") == "revision" and item.get("comment"):
+                msg += f"💬 <i>Замечание: {html.escape(str(item['comment']))}</i>\n"
+            msg += "\n"
+    return msg.strip()
+
+
+def format_single_day_hw_for_adult(entries, student_name: str, due_date_str: str):
+    show_status = STUDENTS[student_name].get("can_submit", False)
+    try:
+        dt = datetime.strptime(due_date_str, "%d.%m.%Y")
+        wd_short = WEEKDAYS_SHORT.get(dt.weekday(), "")
+        header_date = f"{due_date_str} ({wd_short})"
+    except ValueError:
+        header_date = due_date_str
+
+    msg = f"📚 <b>Задания {student_name} на {header_date}:</b>\n\n"
+    for item in entries:
+        st_str = ""
+        if show_status:
+            st_label = STATUS_LABELS.get(item.get("status", "new"), item.get("status", "new"))
+            st_str = f" [{st_label}]"
+        msg += f"• <b>{item['subject']}</b>{st_str}:\n{item['text']}\n"
+        if show_status and item.get("status") == "revision" and item.get("comment"):
+            msg += f"💬 <i>Замечание: {html.escape(str(item['comment']))}</i>\n"
+        msg += "\n"
     return msg.strip()
 
 
@@ -840,13 +962,7 @@ def format_grades_message(entries, title):
             grouped[d_date] = []
         grouped[d_date].append(entry)
 
-    def parse_date(d):
-        try:
-            return datetime.strptime(d, "%d.%m.%Y")
-        except ValueError:
-            return datetime.max
-
-    sorted_dates = sorted(grouped.keys(), key=parse_date)
+    sorted_dates = sorted(grouped.keys(), key=parse_due_date_sort)
     msg = f"<b>{title}</b>\n\n"
     for d_date in sorted_dates:
         msg += f"📅 <b>За {d_date}:</b>\n"
@@ -862,14 +978,16 @@ def format_day_button_label(due_date_str: str) -> str:
     try:
         dt = datetime.strptime(due_date_str, "%d.%m.%Y").date()
     except ValueError:
-        return f"📆 На {due_date_str}"
+        return f"📆 {due_date_str}"
 
     diff = (dt - today).days
     wd_acc = WEEKDAYS_ACCUSATIVE.get(dt.weekday(), "")
     wd_short = WEEKDAYS_SHORT.get(dt.weekday(), "")
     short_date = dt.strftime("%d.%m")
 
-    if diff == 0:
+    if diff < 0:
+        return f"⚠️ За {wd_short} ({short_date})"
+    elif diff == 0:
         return f"🔥 На сегодня ({wd_short}, {short_date})"
     elif diff == 1:
         return f"📌 На завтра ({wd_short}, {short_date})"
@@ -879,7 +997,22 @@ def format_day_button_label(due_date_str: str) -> str:
         return f"📆 На {wd_acc} ({short_date})"
 
 
-# --- ДЕТСКОЕ МЕНЮ (МГНОВЕННАЯ РАБОТА ИЗ КЭША) ---
+def format_adult_day_button_label(due_date_str: str, day_items: list, student_name: str) -> str:
+    base = format_day_button_label(due_date_str)
+    total = len(day_items)
+    can_submit = STUDENTS[student_name].get("can_submit", False)
+
+    if not can_submit:
+        return f"{base} • {total} ур."
+
+    done_cnt = sum(1 for x in day_items if x.get("status") == "done")
+    if done_cnt == total and total > 0:
+        clean_base = re.sub(r"^[^\wА-Яа-яЁё]+\s*", "", base)
+        return f"✅ {clean_base} • {done_cnt}/{total}"
+    return f"{base} • готово {done_cnt}/{total}"
+
+
+# --- ДЕТСКОЕ МЕНЮ ---
 
 async def get_active_child_hw(student_name: str):
     if not HW_CACHE:
@@ -887,7 +1020,7 @@ async def get_active_child_hw(student_name: str):
 
     student_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
     if not student_items:
-        parsed = await fetch_avers(student_name)
+        parsed = await fetch_avers(student_name, interactive=True)
         if parsed:
             hw_list, grades_list = parsed
             merge_avers_into_cache(student_name, hw_list)
@@ -918,9 +1051,11 @@ async def get_hw_item_fast(hw_id: str):
         return HW_CACHE[hw_id]
     res = await gas_request({"action": "get_item", "id": hw_id}, retries=1)
     if res and res.get("status") == "ok" and res.get("item"):
-        HW_CACHE[hw_id] = res["item"]
+        item_copy = dict(res["item"])
+        item_copy["gas_synced"] = True
+        HW_CACHE[hw_id] = item_copy
         save_hw_cache()
-        return res["item"]
+        return item_copy
     return None
 
 
@@ -938,14 +1073,7 @@ async def build_child_days_view(student_name: str):
         return text, [[cb_btn("🔄 Обновить список", "child_days")]]
 
     dates_set = set(item["due_date"] for item in items)
-
-    def parse_date(d):
-        try:
-            return datetime.strptime(d, "%d.%m.%Y")
-        except ValueError:
-            return datetime.max
-
-    sorted_dates = sorted(list(dates_set), key=parse_date)
+    sorted_dates = sorted(list(dates_set), key=parse_due_date_sort)
     buttons = []
     for d_str in sorted_dates:
         label = format_day_button_label(d_str)
@@ -997,18 +1125,143 @@ async def build_child_item_view(student_name: str, hw_id: str):
     return text, buttons
 
 
-# --- ВЗРОСЛОЕ МЕНЮ ---
+# --- ВЗРОСЛОЕ МЕНЮ (ПО ДНЯМ) ---
 
 def build_adult_main_menu(user_id: int):
-    allowed_students = ADULT_ACCESS.get(user_id, [])
+    perms = ADULT_ACCESS.get(user_id, {"hw": [], "grades": []})
+    hw_allowed = perms.get("hw", [])
+    gr_allowed = perms.get("grades", [])
+
     buttons = []
-    for s_name in allowed_students:
-        buttons.append([
-            cb_btn(f"📚 ДЗ {s_name}", f"a_hw:{s_name}"),
-            cb_btn(f"📊 Оценки {s_name}", f"a_gr:{s_name}")
-        ])
+    grade_only_row = []
+
+    for s_name in STUDENTS.keys():
+        has_hw = s_name in hw_allowed
+        has_gr = s_name in gr_allowed
+
+        if has_hw and has_gr:
+            if grade_only_row:
+                buttons.append(grade_only_row)
+                grade_only_row = []
+            buttons.append([
+                cb_btn(f"📚 ДЗ {s_name}", f"a_hw:{s_name}"),
+                cb_btn(f"📊 Оценки {s_name}", f"a_gr:{s_name}")
+            ])
+        elif has_hw:
+            if grade_only_row:
+                buttons.append(grade_only_row)
+                grade_only_row = []
+            buttons.append([cb_btn(f"📚 ДЗ {s_name}", f"a_hw:{s_name}")])
+        elif has_gr:
+            grade_only_row.append(cb_btn(f"📊 Оценки {s_name}", f"a_gr:{s_name}"))
+            if len(grade_only_row) == 2:
+                buttons.append(grade_only_row)
+                grade_only_row = []
+
+    if grade_only_row:
+        buttons.append(grade_only_row)
+
     greeting = ADULT_GREETINGS.get(user_id, "👋 Главное меню. Выберите нужный раздел:")
     return greeting, buttons
+
+
+def split_adult_hw_by_relevance(student_name: str):
+    today = datetime.now(MOSCOW_TZ).date()
+    week_start = today - timedelta(days=today.weekday())
+
+    student_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
+    upcoming_by_date = {}
+    past_week_by_date = {}
+
+    for item in student_items:
+        d_str = item.get("due_date", "")
+        status = item.get("status", "new")
+        try:
+            due_dt = datetime.strptime(d_str, "%d.%m.%Y").date()
+            if due_dt >= today or status in ("revision", "pending"):
+                upcoming_by_date.setdefault(d_str, []).append(item)
+            elif due_dt >= week_start:
+                past_week_by_date.setdefault(d_str, []).append(item)
+        except ValueError:
+            if status in ("revision", "pending") or is_recent_date(item.get("given_date", ""), max_days=14):
+                upcoming_by_date.setdefault(d_str, []).append(item)
+
+    return upcoming_by_date, past_week_by_date
+
+
+def build_adult_days_view(student_name: str, offline_note: bool = False):
+    s_key = STUDENTS[student_name]["key"]
+    upcoming_by_date, past_week_by_date = split_adult_hw_by_relevance(student_name)
+
+    buttons = []
+    for d_str in sorted(upcoming_by_date.keys(), key=parse_due_date_sort):
+        label = format_adult_day_button_label(d_str, upcoming_by_date[d_str], student_name)
+        buttons.append([cb_btn(label, f"a_day:{s_key}:{d_str}")])
+
+    if past_week_by_date:
+        buttons.append([cb_btn("🗂 Прошедшие дни недели", f"a_past:{s_key}")])
+
+    buttons.append([
+        cb_btn("🔄 Обновить", f"a_hw_ref:{s_key}"),
+        cb_btn("🏠 В меню", "adult_menu")
+    ])
+
+    note_str = "\n<i>(сайт школы не ответил, показаны сохраненные данные)</i>" if offline_note else ""
+    if not upcoming_by_date:
+        text = f"📭 Актуальных заданий для <b>{student_name}</b> на ближайшие дни пока нет.{note_str}"
+    else:
+        text = f"📚 <b>Домашние задания ({student_name})</b>{note_str}\nВыберите день:"
+
+    return text, buttons
+
+
+def build_adult_past_days_view(student_name: str):
+    s_key = STUDENTS[student_name]["key"]
+    _, past_week_by_date = split_adult_hw_by_relevance(student_name)
+
+    buttons = []
+    for d_str in sorted(past_week_by_date.keys(), key=parse_due_date_sort):
+        day_items = past_week_by_date[d_str]
+        try:
+            dt = datetime.strptime(d_str, "%d.%m.%Y").date()
+            wd_short = WEEKDAYS_SHORT.get(dt.weekday(), "")
+            short_date = dt.strftime("%d.%m")
+            base = f"🗓 За {wd_short} ({short_date})"
+        except ValueError:
+            base = f"🗓 {d_str}"
+
+        if STUDENTS[student_name].get("can_submit"):
+            done_cnt = sum(1 for x in day_items if x.get("status") == "done")
+            label = f"{base} • готово {done_cnt}/{len(day_items)}"
+        else:
+            label = f"{base} • {len(day_items)} ур."
+        buttons.append([cb_btn(label, f"a_pday:{s_key}:{d_str}")])
+
+    buttons.append([
+        cb_btn("⬅️ К актуальным", f"a_days:{s_key}"),
+        cb_btn("🏠 В меню", "adult_menu")
+    ])
+
+    if not past_week_by_date:
+        return f"📭 Прошедших заданий на этой неделе ({student_name}) нет.", buttons
+    return f"🗂 <b>Прошедшие дни этой недели ({student_name})</b>\nВыберите дату:", buttons
+
+
+def build_adult_day_detail_view(student_name: str, due_date_str: str, is_past: bool = False):
+    s_key = STUDENTS[student_name]["key"]
+    day_items = [
+        v for v in HW_CACHE.values()
+        if v.get("student") == student_name and v.get("due_date") == due_date_str
+    ]
+
+    back_btn = cb_btn("⬅️ К прошедшим", f"a_past:{s_key}") if is_past else cb_btn("⬅️ К выбору дня", f"a_days:{s_key}")
+    buttons = [[back_btn, cb_btn("🏠 В меню", "adult_menu")]]
+
+    if not day_items:
+        return f"📭 Заданий на {due_date_str} ({student_name}) не найдено.", buttons
+
+    report = format_single_day_hw_for_adult(day_items, student_name, due_date_str)
+    return report, buttons
 
 
 def build_adult_grades_menu(student_name: str):
@@ -1107,6 +1360,7 @@ async def handle_text_or_media_message(message: dict):
             comment_for_sheet = text if text else "🎤 Голосовое сообщение от бабушки"
             item["status"] = "revision"
             item["comment"] = comment_for_sheet
+            item["gas_synced"] = False
             HW_CACHE[hw_id] = item
             save_hw_cache()
             pop_user_state(user_id)
@@ -1182,7 +1436,7 @@ async def handle_text_or_media_message(message: dict):
                 start_date, end_date = end_date, start_date
 
             await send_max_message(user_id, f"⏳ Собираю оценки с {start_date} по {end_date} ({student_name})...")
-            parsed = await fetch_avers(student_name, start_date, end_date)
+            parsed = await fetch_avers(student_name, start_date, end_date, interactive=True)
             _, buttons = build_adult_grades_menu(student_name)
 
             if not parsed:
@@ -1209,7 +1463,7 @@ async def handle_text_or_media_message(message: dict):
         if has_photo:
             msg_text = (
                 "📸 Вижу фотографию! Чтобы сдать домашку бабушке на проверку, сначала выбери ниже день "
-                "и предмет, а внутри него нажми кнопку <b>«Я завершил!»</b> 👇"
+                "и предмет, а внутри него нажми кнопку <b>\"Я завершил!\"</b> 👇"
             )
         await send_max_message(user_id, msg_text, buttons)
         return
@@ -1297,7 +1551,6 @@ async def handle_callback_event(update: dict):
                 )
                 return
 
-            # Сначала отправляем фотографии бабушке Наташе, не стирая их из памяти заранее
             reviewer_id = s_info.get("reviewer_id")
             if reviewer_id:
                 rel_label = "👧 Внучка" if is_female else "👦 Внук"
@@ -1325,12 +1578,12 @@ async def handle_callback_event(update: dict):
                     )
                     return
 
-            # Фиксируем сдачу в локальном кэше и очищаем состояние только после доставки
             pop_user_state(user_id)
             photos_tokens = [p["token"] if isinstance(p, dict) else str(p) for p in photos]
             photos_json = json.dumps(photos_tokens, ensure_ascii=False)
             item["status"] = "pending"
             item["photos"] = photos_json
+            item["gas_synced"] = False
             HW_CACHE[hw_id] = item
             save_hw_cache()
 
@@ -1350,6 +1603,10 @@ async def handle_callback_event(update: dict):
 
     # --- НАВИГАЦИЯ ВЗРОСЛЫХ И ПРОВЕРКА БАБУШКОЙ ---
     if user_id in ADULT_ACCESS:
+        perms = ADULT_ACCESS[user_id]
+        hw_allowed = perms.get("hw", [])
+        gr_allowed = perms.get("grades", [])
+
         if payload == "adult_menu":
             pop_user_state(user_id)
             text, buttons = build_adult_main_menu(user_id)
@@ -1364,6 +1621,7 @@ async def handle_callback_event(update: dict):
                 return
 
             item["status"] = "done"
+            item["gas_synced"] = False
             HW_CACHE[hw_id] = item
             save_hw_cache()
             asyncio.create_task(bg_update_gas_status(hw_id, status="done"))
@@ -1412,67 +1670,82 @@ async def handle_callback_event(update: dict):
             await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
-        if payload.startswith("a_hw:"):
-            student_name = payload.split(":", 1)[1]
-            if student_name not in ADULT_ACCESS[user_id]:
+        # Открытие меню дней ДЗ (с опросом дневника)
+        if payload.startswith("a_hw:") or payload.startswith("a_hw_ref:"):
+            raw_target = payload.split(":", 1)[1]
+            student_name = resolve_student_name(raw_target)
+            if not student_name or student_name not in hw_allowed:
+                text, buttons = build_adult_main_menu(user_id)
+                await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons, notification="Раздел отключен")
                 return
-            await answer_max_callback(callback_id, user_id=user_id, notification=f"⏳ Загружаю ДЗ ({student_name})...")
 
-            today_start = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
-            week_start = (today_start - timedelta(days=today_start.weekday())).date()
-
-            parsed = await fetch_avers(student_name)
-            title_prefix = f"📚 Текущие задания ({student_name}):"
-
+            parsed = await fetch_avers(student_name, interactive=True)
+            offline_note = False
             if parsed:
                 hw_list, grades_list = parsed
                 merge_avers_into_cache(student_name, hw_list)
                 asyncio.create_task(bg_sync_student_to_gas(student_name, hw_list, grades_list))
-                source_items = [HW_CACHE.get(h["id"], h) for h in hw_list]
             else:
-                # Если школьный сайт выдал 502, отдаем задания из локального кэша
-                source_items = [v for v in HW_CACHE.values() if v.get("student") == student_name]
-                if not source_items:
-                    await send_max_message(user_id, "😕 Школьный дневник временно недоступен (ошибка сервера школы).", build_adult_main_menu(user_id)[1])
+                has_cached = any(v.get("student") == student_name for v in HW_CACHE.values())
+                if not has_cached:
+                    text, buttons = build_adult_main_menu(user_id)
+                    await answer_max_callback(
+                        callback_id,
+                        user_id=user_id,
+                        text="😕 Школьный дневник временно недоступен (ошибка сервера школы).",
+                        buttons=buttons
+                    )
                     return
-                title_prefix = f"⚠️ Дневник временно недоступен, сохраненные задания ({student_name}):"
+                offline_note = True
 
-            filtered_hw = []
-            for h in source_items:
-                item_copy = dict(h)
-                item_copy["status"] = HW_CACHE.get(h["id"], {}).get("status", h.get("status", "new"))
-                try:
-                    g_dt = datetime.strptime(item_copy["given_date"], "%d.%m.%Y").date()
-                    d_dt = datetime.strptime(item_copy["due_date"], "%d.%m.%Y").date()
-                    if g_dt >= week_start or d_dt >= week_start:
-                        filtered_hw.append(item_copy)
-                except ValueError:
-                    if is_recent_date(item_copy.get("given_date", ""), max_days=14):
-                        filtered_hw.append(item_copy)
-
-            show_st = STUDENTS[student_name].get("can_submit", False)
-            if not filtered_hw:
-                await send_max_message(
-                    user_id,
-                    f"📭 Заданий на текущую неделю для {student_name} пока нет.",
-                    build_adult_main_menu(user_id)[1]
-                )
-            else:
-                report = format_hw_message(filtered_hw, title_prefix, show_status=show_st)
-                await send_max_message(user_id, report, build_adult_main_menu(user_id)[1])
+            text, buttons = build_adult_days_view(student_name, offline_note=offline_note)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
+        # Быстрый возврат к выбору дня из кэша
+        if payload.startswith("a_days:"):
+            student_name = resolve_student_name(payload.split(":", 1)[1])
+            if not student_name or student_name not in hw_allowed:
+                return
+            text, buttons = build_adult_days_view(student_name)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
+            return
+
+        # Прошедшие дни текущей недели
+        if payload.startswith("a_past:"):
+            student_name = resolve_student_name(payload.split(":", 1)[1])
+            if not student_name or student_name not in hw_allowed:
+                return
+            text, buttons = build_adult_past_days_view(student_name)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
+            return
+
+        # Карточка выбранного дня (актуального или прошедшего)
+        if payload.startswith("a_day:") or payload.startswith("a_pday:"):
+            parts = payload.split(":", 2)
+            if len(parts) < 3:
+                return
+            is_past = parts[0] == "a_pday"
+            student_name = resolve_student_name(parts[1])
+            due_date_str = parts[2]
+            if not student_name or student_name not in hw_allowed:
+                return
+            text, buttons = build_adult_day_detail_view(student_name, due_date_str, is_past=is_past)
+            await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
+            return
+
+        # Оценки
         if payload.startswith("a_gr:"):
-            student_name = payload.split(":", 1)[1]
-            if student_name not in ADULT_ACCESS[user_id]:
+            student_name = resolve_student_name(payload.split(":", 1)[1])
+            if not student_name or student_name not in gr_allowed:
                 return
             text, buttons = build_adult_grades_menu(student_name)
             await answer_max_callback(callback_id, user_id=user_id, text=text, buttons=buttons)
             return
 
         if payload.startswith("a_gr_week:"):
-            student_name = payload.split(":", 1)[1]
-            if student_name not in ADULT_ACCESS[user_id]:
+            student_name = resolve_student_name(payload.split(":", 1)[1])
+            if not student_name or student_name not in gr_allowed:
                 return
             await answer_max_callback(callback_id, user_id=user_id, notification=f"⏳ Загружаю оценки ({student_name})...")
 
@@ -1480,7 +1753,7 @@ async def handle_callback_event(update: dict):
             start_of_week = (today - timedelta(days=today.weekday())).strftime("%d.%m.%Y")
             end_of_week = (today - timedelta(days=today.weekday()) + timedelta(days=6)).strftime("%d.%m.%Y")
 
-            parsed = await fetch_avers(student_name, start_of_week, end_of_week)
+            parsed = await fetch_avers(student_name, start_of_week, end_of_week, interactive=True)
             _, buttons = build_adult_grades_menu(student_name)
 
             if not parsed:
@@ -1496,8 +1769,8 @@ async def handle_callback_event(update: dict):
             return
 
         if payload.startswith("a_gr_per:"):
-            student_name = payload.split(":", 1)[1]
-            if student_name not in ADULT_ACCESS[user_id]:
+            student_name = resolve_student_name(payload.split(":", 1)[1])
+            if not student_name or student_name not in gr_allowed:
                 return
             set_user_state(user_id, {"state": "waiting_start_date", "student_name": student_name})
             await answer_max_callback(
@@ -1512,11 +1785,14 @@ async def handle_callback_event(update: dict):
 # --- ФОНОВАЯ СИНХРОНИЗАЦИЯ И РАССЫЛКА ПО РАСПИСАНИЮ ---
 
 async def check_and_send():
+    if not INITIAL_GAS_SYNCED:
+        await refresh_hw_cache_from_gas()
+
     now_msk = datetime.now(MOSCOW_TZ)
     current_hour = now_msk.hour
 
     for student_name, student_data in STUDENTS.items():
-        parsed = await fetch_avers(student_name)
+        parsed = await fetch_avers(student_name, interactive=False)
         if not parsed:
             continue
 
@@ -1552,7 +1828,7 @@ async def check_and_send():
 
         # 2. Детям уведомления уходят начиная с 14:00
         child_id = student_data.get("child_user_id")
-        if child_id and current_hour >= 14:
+        if child_id and current_hour >= 14 and INITIAL_GAS_SYNCED:
             unnotified_items = [
                 v for v in HW_CACHE.values()
                 if v.get("student") == student_name and v.get("notified_child") == "no"
@@ -1570,8 +1846,9 @@ async def check_and_send():
                         for hid in ids_to_mark:
                             if hid in HW_CACHE:
                                 HW_CACHE[hid]["notified_child"] = "yes"
+                                HW_CACHE[hid]["gas_synced"] = False
                         save_hw_cache()
-                        asyncio.create_task(gas_request({"action": "mark_notified", "ids": ids_to_mark}, retries=2))
+                        asyncio.create_task(bg_mark_notified_gas(ids_to_mark))
                 elif active_items:
                     msg_rem = (
                         f"🐦 Чирик, котик линтеха! {child_nom}, напоминаю, что у тебя есть "
@@ -1589,8 +1866,9 @@ async def check_and_send():
                     for hid in ids_to_mark:
                         if hid in HW_CACHE:
                             HW_CACHE[hid]["notified_child"] = "yes"
+                            HW_CACHE[hid]["gas_synced"] = False
                     save_hw_cache()
-                    asyncio.create_task(gas_request({"action": "mark_notified", "ids": ids_to_mark}, retries=2))
+                    asyncio.create_task(bg_mark_notified_gas(ids_to_mark))
 
         await asyncio.sleep(2)
 
